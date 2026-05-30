@@ -54,6 +54,8 @@ hardening when the local toolchain has the `clippy` component installed.
 
 Build prompts 00-28 are passing. Prompt 28 (inference forwarding gateway) makes Anemoi an OpenAI-compatible endpoint for opencode: `POST /v1/chat/completions` treats the `model` field as a governance domain, runs `decide`, records telemetry, rewrites `model` to the selected runtime model, and streams the runtime response back with `X-Anemoi-Decision-Id`, `X-Anemoi-Selected-Model`, and `X-Anemoi-Action` headers. Mock forwarding works without `ANEMOI_ENABLE_LIVE_EXECUTE=1`; non-mock forwarding requires it.
 
+Issue #12 (resident transition emission) is complete: the reconciliation loop now diffs resident sets each tick and records every state change to the `resident_events` table through the `DecisionLog` trait, with a non-anonymous evidence source naming the adapter and reconciliation round. The event store stays optional (default no-op trait method; only SQLite persists transitions).
+
 Prompt 01 passed with:
 
 - `accepts_example_config`
@@ -263,6 +265,29 @@ asserts the recorded value round-trips, rather than asserting `is_ok`. The
 `resident_events` table follows the issue #12 schema with a NOT NULL
 `evidence_source`. `execution_events`/`policy_events` tables are deferred: no
 required test exercises them and they belong to later prompts (21-23).
+
+Issue #12 (resident transition emission) wired the reconciliation loop to the
+`resident_events` table:
+
+- `resident_transitions_detects_first_observation_change_and_skips_unchanged`
+  (`anemoi-daemon`)
+- `reconciliation_tick_records_resident_transition` (`anemoi-daemon`)
+
+Prompt 27 built the `resident_events` table but only its own test called
+`record_resident_event`; nothing emitted transitions from the running daemon.
+Issue #12 closes that gap: each reconciliation tick diffs the previous and
+current resident sets per runtime and records every state change through the
+`DecisionLog` trait via `record_resident_transition` (a default no-op so the
+event store stays optional — in-memory/JSONL logs ignore transitions, only
+SQLite persists them). First observations record a `cold` → observed
+transition carrying a note, since `ResidencyState` has no `unknown` variant and
+issue #12 forbids inventing one. Evidence source is never anonymous: it names
+the adapter and the reconciliation round (`"<adapter> reconciliation round
+<n>"`). Vanished residents are not recorded (their target state is
+unobserved). `reconciliation_tick_records_resident_transition` reopens the
+SQLite store and asserts the persisted row's `from_state`, `to_state`,
+`runtime_id`, null `decision_id`, note text, and evidence string, rather than
+asserting `is_ok`.
 
 Prompt 28 passed with:
 

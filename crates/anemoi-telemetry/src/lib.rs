@@ -20,11 +20,36 @@ pub enum TelemetryError {
     Database(#[from] rusqlite::Error),
 }
 
+/// Parameters for recording a resident state transition (issue #12). Bundled
+/// into one borrowing struct so the `DecisionLog` trait method stays within
+/// argument limits and callers name each field at the call site.
+pub struct ResidentTransitionRecord<'a> {
+    pub model_id: &'a str,
+    pub runtime_id: &'a str,
+    pub from_state: ResidencyState,
+    pub to_state: ResidencyState,
+    pub observed_at: DateTime<Utc>,
+    pub evidence_source: &'a str,
+    pub decision_id: Option<Uuid>,
+    pub note: Option<&'a str>,
+}
+
 #[async_trait]
 pub trait DecisionLog: Send + Sync {
     async fn record_decision(&self, decision: &Decision) -> Result<(), TelemetryError>;
     async fn get_decision(&self, id: Uuid) -> Result<Option<Decision>, TelemetryError>;
     async fn list_decisions(&self) -> Result<Vec<Decision>, TelemetryError>;
+
+    /// Records a resident state transition observed by the reconciliation loop
+    /// (issue #12). Default no-op so the event store stays optional: the
+    /// in-memory and JSONL logs silently ignore transitions (no database = no
+    /// resident events, no error). Only [`SqliteEventStore`] persists them.
+    async fn record_resident_transition(
+        &self,
+        _transition: ResidentTransitionRecord<'_>,
+    ) -> Result<(), TelemetryError> {
+        Ok(())
+    }
 }
 
 pub type DynDecisionLog = Arc<dyn DecisionLog>;
@@ -286,6 +311,22 @@ impl DecisionLog for SqliteEventStore {
             decisions.push(serde_json::from_str(&json?)?);
         }
         Ok(decisions)
+    }
+
+    async fn record_resident_transition(
+        &self,
+        transition: ResidentTransitionRecord<'_>,
+    ) -> Result<(), TelemetryError> {
+        self.record_resident_event(
+            transition.model_id,
+            transition.runtime_id,
+            &transition.from_state,
+            &transition.to_state,
+            transition.observed_at,
+            transition.evidence_source,
+            transition.decision_id,
+            transition.note,
+        )
     }
 }
 

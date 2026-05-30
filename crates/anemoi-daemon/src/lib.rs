@@ -8,7 +8,7 @@ use anemoi_runtime::{
     DynRuntimeAdapter, ForwardedChatCompletion, LlamaCppAdapter, LlamaSwapAdapter,
     MockRuntimeAdapter, OllamaAdapter,
 };
-use anemoi_telemetry::{DynDecisionLog, InMemoryDecisionLog};
+use anemoi_telemetry::{DynDecisionLog, InMemoryDecisionLog, ResidentTransitionRecord};
 use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::{header, HeaderValue, StatusCode};
@@ -19,6 +19,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tower_http::trace::TraceLayer;
@@ -147,6 +148,59 @@ impl Default for Reconciler {
     fn default() -> Self {
         Self::new(DEFAULT_RECONCILIATION_TTL_MS)
     }
+}
+
+/// A resident state transition detected between two consecutive reconciliation
+/// snapshots (issue #12).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResidentTransitionDetail {
+    pub model_id: ModelId,
+    pub from_state: ResidencyState,
+    pub to_state: ResidencyState,
+    /// True when `to_state` is the first time this model is observed and
+    /// `from_state` was inferred as `Cold` rather than read from a prior
+    /// snapshot.
+    pub first_observation: bool,
+}
+
+/// Detects residency transitions between the previous and current snapshot's
+/// residents (issue #12).
+///
+/// A model present in `current` whose state differs from `previous` — or that
+/// is newly present — yields one transition. A newly present model's prior
+/// state is inferred as `Cold`: the established-vocabulary representation of
+/// "not resident". Issue #12 forbids inventing an `Unknown` variant, and `Cold`
+/// is the honest stand-in (the `first_observation` flag and an accompanying
+/// note mark it as inferred rather than observed).
+///
+/// Models that vanished from `current` produce no transition: their target
+/// state is not observed, and inferring one (cold? evicting?) would be
+/// speculative. Only observed states are recorded.
+fn resident_transitions(
+    previous: &[ModelResident],
+    current: &[ModelResident],
+) -> Vec<ResidentTransitionDetail> {
+    let prior: HashMap<&ModelId, &ResidencyState> =
+        previous.iter().map(|r| (&r.model_id, &r.state)).collect();
+    let mut transitions = Vec::new();
+    for resident in current {
+        match prior.get(&resident.model_id) {
+            Some(&prev) if *prev == resident.state => {}
+            Some(&prev) => transitions.push(ResidentTransitionDetail {
+                model_id: resident.model_id.clone(),
+                from_state: prev.clone(),
+                to_state: resident.state.clone(),
+                first_observation: false,
+            }),
+            None => transitions.push(ResidentTransitionDetail {
+                model_id: resident.model_id.clone(),
+                from_state: ResidencyState::Cold,
+                to_state: resident.state.clone(),
+                first_observation: true,
+            }),
+        }
+    }
+    transitions
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -397,6 +451,10 @@ pub struct AppState {
     decision_log: DynDecisionLog,
     reconciler: Reconciler,
     staging_worker: StagingWorker,
+    /// Monotonic reconciliation tick counter. Stamped into the
+    /// `evidence_source` of resident events so each transition records which
+    /// inspection round observed it (issue #12).
+    reconciliation_round: Arc<AtomicU64>,
     /// Test seam for the live-execute gate. `None` reads the real
     /// `ANEMOI_ENABLE_LIVE_EXECUTE` env var (production); `Some(_)` overrides it
     /// so tests can exercise the gate without mutating process-global state.
@@ -472,6 +530,7 @@ impl AppState {
             decision_log,
             reconciler,
             staging_worker,
+            reconciliation_round: Arc::new(AtomicU64::new(0)),
             live_execute: None,
         })
     }
@@ -541,6 +600,7 @@ impl AppState {
             decision_log: Arc::new(InMemoryDecisionLog::default()),
             reconciler,
             staging_worker,
+            reconciliation_round: Arc::new(AtomicU64::new(0)),
             live_execute: None,
         })
     }
@@ -939,9 +999,22 @@ impl AppState {
     }
 
     pub async fn run_reconciliation_tick(&self) {
+        let round = self.reconciliation_round.fetch_add(1, Ordering::Relaxed) + 1;
         for (runtime_id, adapter) in &self.runtimes {
             match adapter.inspect().await {
                 Ok(snapshot) => {
+                    let previous = self.reconciler.get(runtime_id).await;
+                    let prior_residents = previous
+                        .as_ref()
+                        .map(|p| p.snapshot.residents.as_slice())
+                        .unwrap_or(&[]);
+                    self.emit_resident_transitions(
+                        runtime_id,
+                        prior_residents,
+                        &snapshot.residents,
+                        round,
+                    )
+                    .await;
                     self.reconciler.update(runtime_id, snapshot).await;
                 }
                 Err(e) => {
@@ -950,6 +1023,45 @@ impl AppState {
                         .await;
                 }
             }
+        }
+    }
+
+    /// Records resident transitions for one runtime into the durable event
+    /// store (issue #12). Reconciliation is observation-only, so every
+    /// transition is recorded with `decision_id = None`; the `evidence_source`
+    /// names the adapter and inspection round so no transition is anonymous.
+    /// Recording is best-effort — a telemetry error must not abort the tick.
+    async fn emit_resident_transitions(
+        &self,
+        runtime_id: &str,
+        previous: &[ModelResident],
+        current: &[ModelResident],
+        round: u64,
+    ) {
+        let transitions = resident_transitions(previous, current);
+        if transitions.is_empty() {
+            return;
+        }
+        let adapter = self.runtime_adapter_type(runtime_id).unwrap_or("unknown");
+        let evidence = format!("{adapter} reconciliation round {round}");
+        let observed_at = Utc::now();
+        for transition in &transitions {
+            let note = transition
+                .first_observation
+                .then_some("first observation; prior state inferred as cold");
+            let _ = self
+                .decision_log
+                .record_resident_transition(ResidentTransitionRecord {
+                    model_id: transition.model_id.0.as_str(),
+                    runtime_id,
+                    from_state: transition.from_state.clone(),
+                    to_state: transition.to_state.clone(),
+                    observed_at,
+                    evidence_source: &evidence,
+                    decision_id: None,
+                    note,
+                })
+                .await;
         }
     }
 
@@ -1560,6 +1672,99 @@ mod tests {
             !snapshot.snapshot.available,
             "snapshot should be marked unavailable"
         );
+    }
+
+    #[test]
+    fn resident_transitions_detects_first_observation_change_and_skips_unchanged() {
+        let model = |id: &str, state: ResidencyState| ModelResident {
+            model_id: ModelId(id.to_string()),
+            state,
+            vram_mb: None,
+            ram_mb: None,
+            kv_cache_mb: None,
+            loaded_since: None,
+        };
+
+        // First observation: no prior snapshot → from_state inferred as Cold.
+        let first = resident_transitions(&[], &[model("qwen9b", ResidencyState::HotGpu)]);
+        assert_eq!(
+            first,
+            vec![ResidentTransitionDetail {
+                model_id: ModelId("qwen9b".to_string()),
+                from_state: ResidencyState::Cold,
+                to_state: ResidencyState::HotGpu,
+                first_observation: true,
+            }]
+        );
+
+        // State change between ticks: from_state is the observed prior state.
+        let changed = resident_transitions(
+            &[model("qwen9b", ResidencyState::Loading)],
+            &[model("qwen9b", ResidencyState::HotGpu)],
+        );
+        assert_eq!(
+            changed,
+            vec![ResidentTransitionDetail {
+                model_id: ModelId("qwen9b".to_string()),
+                from_state: ResidencyState::Loading,
+                to_state: ResidencyState::HotGpu,
+                first_observation: false,
+            }]
+        );
+
+        // Unchanged state records no transition (absence is the behavior).
+        let unchanged = resident_transitions(
+            &[model("qwen9b", ResidencyState::HotGpu)],
+            &[model("qwen9b", ResidencyState::HotGpu)],
+        );
+        assert!(unchanged.is_empty());
+
+        // A vanished resident records no transition: its target state is not
+        // observed, so inferring one would be speculative.
+        let vanished = resident_transitions(&[model("qwen9b", ResidencyState::HotGpu)], &[]);
+        assert!(vanished.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reconciliation_tick_records_resident_transition() {
+        // Issue #12: the reconciliation loop emits resident_events reachable
+        // from the daemon (not just the telemetry unit test). The example
+        // config's mock runtime starts with qwen9b hot_gpu, so the first tick
+        // records a single cold → hot_gpu transition; a second tick with no
+        // change records nothing.
+        let db_path =
+            std::env::temp_dir().join(format!("anemoi-resident-events-{}.db", Uuid::new_v4()));
+        let store = Arc::new(SqliteEventStore::create(&db_path).expect("sqlite event store"));
+        let state = AppState::new(example_config(), store.clone()).expect("state");
+
+        state.run_reconciliation_tick().await;
+
+        let events = store.resident_events("qwen9b").expect("resident events");
+        assert_eq!(events.len(), 1, "first tick records one transition");
+        let event = &events[0];
+        assert_eq!(event.from_state, "cold");
+        assert_eq!(event.to_state, "hot_gpu");
+        assert_eq!(event.runtime_id, "mock");
+        assert_eq!(
+            event.decision_id, None,
+            "reconciliation is observation-only"
+        );
+        assert_eq!(
+            event.note.as_deref(),
+            Some("first observation; prior state inferred as cold")
+        );
+        assert!(
+            event.evidence_source.contains("reconciliation round 1"),
+            "evidence names the inspection round, got {:?}",
+            event.evidence_source
+        );
+
+        // Second tick: qwen9b is unchanged, so no new transition is recorded.
+        state.run_reconciliation_tick().await;
+        let events = store.resident_events("qwen9b").expect("resident events");
+        assert_eq!(events.len(), 1, "unchanged state records no new transition");
+
+        let _ = std::fs::remove_file(&db_path);
     }
 
     #[tokio::test]
