@@ -123,10 +123,7 @@ impl Scheduler {
         // Live roster: use the runtime's configured_models snapshot directly.
         // Model profiles are synthesised from model IDs — no static config needed.
         if let Some(live_runtime_id) = &domain.live_roster {
-            let Some(snapshot) = snapshots
-                .iter()
-                .find(|s| &s.runtime_id == live_runtime_id)
-            else {
+            let Some(snapshot) = snapshots.iter().find(|s| &s.runtime_id == live_runtime_id) else {
                 return Err(PolicyError::LiveRosterRuntimeMissing(
                     request.domain.clone(),
                     live_runtime_id.clone(),
@@ -139,10 +136,7 @@ impl Scheduler {
                     rejected_options: vec![RejectedOption {
                         model_id: None,
                         runtime_id: Some(live_runtime_id.clone()),
-                        reason: format!(
-                            "live_roster runtime {} is not available",
-                            live_runtime_id
-                        ),
+                        reason: format!("live_roster runtime {} is not available", live_runtime_id),
                     }],
                 });
             }
@@ -1401,12 +1395,7 @@ runtimes:
             ("granite-4.1-8b-gpu", "8b"),
         ];
         for (id, expected) in cases {
-            assert_eq!(
-                extract_parameter_class(id),
-                expected,
-                "failed for {}",
-                id
-            );
+            assert_eq!(extract_parameter_class(id), expected, "failed for {}", id);
         }
     }
 

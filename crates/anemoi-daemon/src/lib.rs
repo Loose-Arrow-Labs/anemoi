@@ -3268,7 +3268,11 @@ continuity:
         let id = Uuid::new_v4();
 
         let cref = cache.write(id, "prompt context".to_string());
-        assert_eq!(cref, ContextRef(id), "the ref is keyed by the staging-intent id");
+        assert_eq!(
+            cref,
+            ContextRef(id),
+            "the ref is keyed by the staging-intent id"
+        );
         assert_eq!(cache.take(&cref), Some("prompt context".to_string()));
         assert_eq!(
             cache.take(&cref),
@@ -3310,7 +3314,11 @@ continuity:
         cache.write_at(middle, "2".to_string(), base + chrono::Duration::seconds(1));
         cache.write_at(newest, "3".to_string(), base + chrono::Duration::seconds(2));
 
-        assert_eq!(cache.len(), 2, "the capacity cap holds the store at two entries");
+        assert_eq!(
+            cache.len(),
+            2,
+            "the capacity cap holds the store at two entries"
+        );
         assert_eq!(
             cache.take(&ContextRef(oldest)),
             None,
@@ -3379,7 +3387,10 @@ continuity:
             untouched.context_ref.is_none(),
             "an intent whose foreground is not draining keeps its pending context"
         );
-        assert_eq!(untouched.pending_context.as_deref(), Some("should stay pending"));
+        assert_eq!(
+            untouched.pending_context.as_deref(),
+            Some("should stay pending")
+        );
 
         let again = worker.commit_eviction_context(&draining, &cache).await;
         assert!(
@@ -3393,8 +3404,7 @@ continuity:
         let mut config = example_config();
         config.continuity.background_load = true;
         config.continuity.keep_small_worker_hot = true;
-        let state =
-            AppState::new(config, Arc::new(InMemoryDecisionLog::default())).expect("state");
+        let state = AppState::new(config, Arc::new(InMemoryDecisionLog::default())).expect("state");
 
         let mut request = sample_request();
         request.escalation_intent = Some(EscalationIntent {
@@ -3425,7 +3435,10 @@ continuity:
 
         let decision = state.decide(&sample_request()).await.expect("decision");
         let model = decision.selected_model.clone().expect("a selected model");
-        let runtime = decision.selected_runtime.clone().expect("a selected runtime");
+        let runtime = decision
+            .selected_runtime
+            .clone()
+            .expect("a selected runtime");
 
         // Simulate a prior escalation: a completed staging intent for the
         // selected model carrying a committed context reference.
