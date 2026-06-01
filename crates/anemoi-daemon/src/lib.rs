@@ -1,7 +1,7 @@
 use anemoi_core::{
-    ActionKind, ActionPlan, AnemoiConfig, Decision, DecisionAction, DomainId, ExecutionMode,
-    InferenceRequest, ModelId, ModelResident, RequestId, ResidencyState, RuntimeId,
-    RuntimeSnapshot,
+    ActionKind, ActionPlan, AnemoiConfig, Decision, DecisionAction, DomainId, EscalationIntent,
+    ExecutionMode, InferenceRequest, ModelId, ModelResident, QualityFloor, RequestId,
+    ResidencyState, RuntimeId, RuntimeSnapshot,
 };
 use anemoi_policy::{EvictionCandidateResident, EvictionPlan, EvictionRequest, Scheduler};
 use anemoi_runtime::{
@@ -2995,6 +2995,161 @@ runtimes:
         })
     }
 
+    fn large_context_gateway_state() -> AppState {
+        let yaml = r#"
+domains:
+  coding:
+    rosters:
+      - small
+      - large
+residency_groups:
+  small:
+    purpose: [interactive]
+    keep_hot: true
+    allow_background_load: true
+    models: [tiny8b]
+  large:
+    purpose: [large context]
+    keep_hot: false
+    allow_background_load: true
+    models: [wide32b]
+models:
+  tiny8b:
+    family: tiny
+    parameter_class: 8b
+    context_window: 8192
+    cold_load_estimate_ms: 0
+    supports_streaming: true
+    supported_runtimes: [mock]
+  wide32b:
+    family: wide
+    parameter_class: 32b
+    context_window: 65536
+    cold_load_estimate_ms: 45000
+    supports_streaming: true
+    supported_runtimes: [mock]
+runtimes:
+  mock:
+    adapter: mock
+    initial_residents:
+      - model_id: tiny8b
+        state: hot_gpu
+continuity:
+  keep_small_worker_hot: true
+  background_load: true
+  max_blank_wait_ms: 1500
+  prefer_degraded_response_over_silence: true
+"#;
+        let config = AnemoiConfig::from_yaml_str(yaml).expect("large context config");
+        AppState::new(config, Arc::new(InMemoryDecisionLog::default())).expect("state")
+    }
+
+    #[test]
+    fn inference_gateway_derives_prompt_tokens_estimate_from_messages() {
+        let body = serde_json::json!({
+            "model": "coding",
+            "messages": [{ "role": "user", "content": "hello world" }]
+        });
+
+        let request = gateway_inference_request("coding", &body).expect("request");
+
+        assert_eq!(request.prompt_tokens_estimate, Some(10));
+    }
+
+    #[test]
+    fn inference_gateway_uses_max_tokens_as_output_estimate() {
+        let mut body = chat_body("coding");
+        body["max_tokens"] = serde_json::json!(123);
+
+        let request = gateway_inference_request("coding", &body).expect("request");
+
+        assert_eq!(request.max_output_tokens, Some(123));
+    }
+
+    #[test]
+    fn inference_gateway_accepts_anemoi_selection_metadata() {
+        let body = serde_json::json!({
+            "model": "coding",
+            "messages": [{ "role": "user", "content": "hello" }],
+            "max_tokens": 12,
+            "anemoi": {
+                "prompt_tokens_estimate": 42000,
+                "max_output_tokens": 2048,
+                "latency_budget_ms": 9000,
+                "quality_floor": { "minimum_parameter_class": "32b" },
+                "escalation_intent": {
+                    "task_type": "planning",
+                    "context": "prior small-model context"
+                }
+            }
+        });
+
+        let request = gateway_inference_request("coding", &body).expect("request");
+
+        assert_eq!(request.prompt_tokens_estimate, Some(42000));
+        assert_eq!(request.max_output_tokens, Some(2048));
+        assert_eq!(request.latency_budget_ms, Some(9000));
+        assert_eq!(
+            request
+                .quality_floor
+                .as_ref()
+                .and_then(|floor| floor.minimum_parameter_class.as_deref()),
+            Some("32b")
+        );
+        assert_eq!(
+            request
+                .escalation_intent
+                .as_ref()
+                .and_then(|intent| intent.context.as_deref()),
+            Some("prior small-model context")
+        );
+    }
+
+    #[tokio::test]
+    async fn inference_gateway_large_context_request_selects_larger_context_model() {
+        let body = serde_json::json!({
+            "model": "coding",
+            "messages": [{ "role": "user", "content": "large context request" }],
+            "anemoi": {
+                "prompt_tokens_estimate": 20000,
+                "max_output_tokens": 1000
+            }
+        });
+
+        let response = router(large_context_gateway_state())
+            .oneshot(json_request("/v1/chat/completions", &body))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-anemoi-selected-model")
+                .expect("selected model")
+                .to_str()
+                .expect("ascii"),
+            "wide32b"
+        );
+    }
+
+    #[test]
+    fn inference_gateway_strips_anemoi_metadata_before_forwarding() {
+        let body = serde_json::json!({
+            "model": "coding",
+            "messages": [{ "role": "user", "content": "hello" }],
+            "anemoi": { "prompt_tokens_estimate": 42000 }
+        });
+
+        let forwarded = gateway_forward_body(body, &ModelId("wide32b".to_string()));
+
+        assert_eq!(forwarded["model"], "wide32b");
+        assert!(
+            forwarded.get("anemoi").is_none(),
+            "private Anemoi metadata must not be forwarded to runtimes"
+        );
+    }
+
     async fn body_value(response: Response) -> Value {
         let bytes = to_bytes(response.into_body(), usize::MAX)
             .await
@@ -4024,6 +4179,127 @@ fn gateway_error(
     response
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct GatewaySelectionMetadata {
+    prompt_tokens_estimate: Option<u32>,
+    max_output_tokens: Option<u32>,
+    latency_budget_ms: Option<u64>,
+    quality_floor: Option<QualityFloor>,
+    escalation_intent: Option<EscalationIntent>,
+}
+
+fn gateway_selection_metadata(
+    body: &serde_json::Value,
+) -> Result<GatewaySelectionMetadata, String> {
+    body.get("anemoi")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .map(|metadata| metadata.unwrap_or_default())
+        .map_err(|error| format!("invalid `anemoi` selection metadata: {error}"))
+}
+
+fn gateway_inference_request(
+    domain: &str,
+    body: &serde_json::Value,
+) -> Result<InferenceRequest, String> {
+    let metadata = gateway_selection_metadata(body)?;
+    Ok(InferenceRequest {
+        id: RequestId::new(),
+        domain: DomainId(domain.to_string()),
+        mode: ExecutionMode::Interactive,
+        prompt_tokens_estimate: metadata
+            .prompt_tokens_estimate
+            .or_else(|| estimate_prompt_tokens_from_messages(body)),
+        max_output_tokens: metadata
+            .max_output_tokens
+            .or_else(|| numeric_body_field_u32(body, "max_tokens"))
+            .or_else(|| numeric_body_field_u32(body, "max_completion_tokens")),
+        latency_budget_ms: metadata
+            .latency_budget_ms
+            .or(Some(DEFAULT_GATEWAY_LATENCY_BUDGET_MS)),
+        quality_floor: metadata.quality_floor,
+        escalation_intent: metadata.escalation_intent,
+    })
+}
+
+fn numeric_body_field_u32(body: &serde_json::Value, field: &str) -> Option<u32> {
+    body.get(field)
+        .and_then(|value| value.as_u64())
+        .and_then(|value| u32::try_from(value).ok())
+}
+
+fn estimate_prompt_tokens_from_messages(body: &serde_json::Value) -> Option<u32> {
+    let messages = body.get("messages")?.as_array()?;
+    let mut total = 2u32;
+    for message in messages {
+        total = total.saturating_add(4);
+        total = total.saturating_add(
+            message
+                .get("role")
+                .and_then(|role| role.as_str())
+                .map(estimate_text_tokens)
+                .unwrap_or(0),
+        );
+        total = total.saturating_add(
+            message
+                .get("name")
+                .and_then(|name| name.as_str())
+                .map(estimate_text_tokens)
+                .unwrap_or(0),
+        );
+        total = total.saturating_add(estimate_message_content_tokens(message.get("content")));
+    }
+    Some(total)
+}
+
+fn estimate_message_content_tokens(content: Option<&serde_json::Value>) -> u32 {
+    match content {
+        Some(serde_json::Value::String(text)) => estimate_text_tokens(text),
+        Some(serde_json::Value::Array(parts)) => parts
+            .iter()
+            .map(|part| match part {
+                serde_json::Value::String(text) => estimate_text_tokens(text),
+                serde_json::Value::Object(object) => object
+                    .get("text")
+                    .and_then(|text| text.as_str())
+                    .map(estimate_text_tokens)
+                    .unwrap_or(0),
+                _ => 0,
+            })
+            .sum(),
+        Some(serde_json::Value::Object(object)) => object
+            .get("text")
+            .and_then(|text| text.as_str())
+            .map(estimate_text_tokens)
+            .unwrap_or(0),
+        _ => 0,
+    }
+}
+
+fn estimate_text_tokens(text: &str) -> u32 {
+    let chars = u32::try_from(text.chars().count()).unwrap_or(u32::MAX);
+    if chars == 0 {
+        0
+    } else {
+        chars.saturating_add(3) / 4
+    }
+}
+
+fn gateway_forward_body(
+    mut body: serde_json::Value,
+    selected_model: &ModelId,
+) -> serde_json::Value {
+    if let Some(object) = body.as_object_mut() {
+        object.remove("anemoi");
+        object.insert(
+            "model".to_string(),
+            serde_json::Value::String(selected_model.to_string()),
+        );
+    }
+    body
+}
+
 /// `POST /v1/chat/completions` — OpenAI-compatible inference forwarding. The
 /// caller names a domain in `model`; Anemoi decides which runtime model serves
 /// it, records the decision, rewrites `model` to the selected model, forwards
@@ -4031,7 +4307,7 @@ fn gateway_error(
 /// runtime model directly.
 async fn chat_completions(
     State(state): State<AppState>,
-    Json(mut body): Json<serde_json::Value>,
+    Json(body): Json<serde_json::Value>,
 ) -> Response {
     let Some(model_field) = body
         .get("model")
@@ -4056,15 +4332,9 @@ async fn chat_completions(
     }
 
     // Run the same decision path as POST /decide; this records telemetry.
-    let request = InferenceRequest {
-        id: RequestId::new(),
-        domain: DomainId(domain.clone()),
-        mode: ExecutionMode::Interactive,
-        prompt_tokens_estimate: None,
-        max_output_tokens: None,
-        latency_budget_ms: Some(DEFAULT_GATEWAY_LATENCY_BUDGET_MS),
-        quality_floor: None,
-        escalation_intent: None,
+    let request = match gateway_inference_request(&domain, &body) {
+        Ok(request) => request,
+        Err(error) => return gateway_error(StatusCode::BAD_REQUEST, error, None),
     };
     let decision = match state.decide(&request).await {
         Ok(decision) => decision,
@@ -4097,8 +4367,9 @@ async fn chat_completions(
         );
     }
 
-    // The caller's domain hint is replaced with the governed model id.
-    body["model"] = serde_json::Value::String(selected_model.to_string());
+    // The caller's domain hint is replaced with the governed model id. Private
+    // Anemoi metadata is consumed locally and never forwarded to runtimes.
+    let body = gateway_forward_body(body, &selected_model);
 
     let forwarded = if is_mock {
         anemoi_runtime::mock_chat_completion(&selected_model.to_string())

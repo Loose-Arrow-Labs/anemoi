@@ -153,9 +153,18 @@ impl Scheduler {
             let candidates = snapshot
                 .configured_models
                 .iter()
-                .map(|model_id| {
+                .filter_map(|model_id| {
                     let profile = synthesize_profile(model_id, live_runtime_id);
-                    generate_candidate(&live_group, &profile, live_runtime_id, snapshot)
+                    if context_window_rejection(request, &profile).is_some() {
+                        None
+                    } else {
+                        Some(generate_candidate(
+                            &live_group,
+                            &profile,
+                            live_runtime_id,
+                            snapshot,
+                        ))
+                    }
                 })
                 .collect();
 
@@ -203,6 +212,15 @@ impl Scheduler {
                     });
                     continue;
                 };
+
+                if let Some(reason) = context_window_rejection(request, model) {
+                    rejected_options.push(RejectedOption {
+                        model_id: Some(model_id.clone()),
+                        runtime_id: None,
+                        reason,
+                    });
+                    continue;
+                }
 
                 let runtime_candidates = model
                     .supported_runtimes
@@ -454,6 +472,19 @@ fn score_candidate(
         );
     }
 
+    if let Some((required, available)) = context_window_fit(request, model) {
+        push(
+            &mut score,
+            &mut reasons,
+            "context_window.fit",
+            10,
+            format!(
+                "request requires {required} token(s) and {} provides a {available} token context window",
+                model.id
+            ),
+        );
+    }
+
     let pressure = PressureModel::default().assess(&PressureInputs {
         memory: &candidate.runtime_memory,
         vram_required_mb: model.vram_required_mb,
@@ -532,6 +563,29 @@ fn quality_score(model: &ModelProfile) -> i32 {
         .parse::<i32>()
         .unwrap_or(1);
     digits.clamp(1, 100)
+}
+
+fn request_required_tokens(request: &InferenceRequest) -> Option<u32> {
+    request
+        .prompt_tokens_estimate
+        .map(|prompt| prompt.saturating_add(request.max_output_tokens.unwrap_or(0)))
+}
+
+fn context_window_fit(request: &InferenceRequest, model: &ModelProfile) -> Option<(u32, u32)> {
+    let required = request_required_tokens(request)?;
+    let available = model.context_window?;
+    (required <= available).then_some((required, available))
+}
+
+fn context_window_rejection(request: &InferenceRequest, model: &ModelProfile) -> Option<String> {
+    let required = request_required_tokens(request)?;
+    let available = model.context_window?;
+    (required > available).then(|| {
+        format!(
+            "request requires {required} token(s) but {} context window is {available} token(s)",
+            model.id
+        )
+    })
 }
 
 fn deny_decision(request: &InferenceRequest, rejected_options: Vec<RejectedOption>) -> Decision {
@@ -1375,6 +1429,71 @@ runtimes:
 "#,
         )
         .expect("candidate config")
+    }
+
+    #[test]
+    fn context_window_fit_rejects_candidate_too_small_for_request() {
+        let scheduler = Scheduler::new(candidate_config());
+        let mut request = candidate_request();
+        request.prompt_tokens_estimate = Some(9000);
+        request.max_output_tokens = Some(1);
+
+        let generated = scheduler
+            .generate_candidates(&request, &[candidate_snapshot(true)])
+            .expect("candidates");
+
+        assert!(
+            generated
+                .candidates
+                .iter()
+                .all(|candidate| candidate.model_id != ModelId("granite8b".to_string())),
+            "granite8b must be rejected because its 8192-token context is too small"
+        );
+        assert!(
+            generated.rejected_options.iter().any(|rejected| {
+                rejected.model_id == Some(ModelId("granite8b".to_string()))
+                    && rejected.reason.contains("requires 9001")
+                    && rejected.reason.contains("8192")
+            }),
+            "rejected options should explain the required and available context window"
+        );
+    }
+
+    #[test]
+    fn context_window_fit_allows_unknown_request_size() {
+        let scheduler = Scheduler::new(candidate_config());
+        let mut request = candidate_request();
+        request.prompt_tokens_estimate = None;
+        request.max_output_tokens = Some(500);
+
+        let generated = scheduler
+            .generate_candidates(&request, &[candidate_snapshot(true)])
+            .expect("candidates");
+
+        assert!(
+            generated
+                .candidates
+                .iter()
+                .any(|candidate| candidate.model_id == ModelId("granite8b".to_string())),
+            "unknown prompt size must not create a false context-window rejection"
+        );
+    }
+
+    #[test]
+    fn context_window_explanation_names_required_and_available_tokens() {
+        let scheduler = Scheduler::new(candidate_config());
+        let decision = scheduler
+            .decide(&candidate_request(), &[candidate_snapshot(true)])
+            .expect("decision");
+
+        assert!(
+            decision.explanation.reasons.iter().any(|reason| {
+                reason.code == "context_window.fit"
+                    && reason.detail.contains("1500 token")
+                    && reason.detail.contains("32768 token context window")
+            }),
+            "selected-model explanation should name required and available context tokens"
+        );
     }
 
     // ── live roster tests ──────────────────────────────────────────────────

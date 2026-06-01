@@ -1,15 +1,16 @@
 # Anemoi Test Roadmap
 
-**Current Status**: ✅ **28/28 Prompts Complete and Passing**
+**Current Status**: **30/30 Prompts Complete and Passing**
 
 This roadmap keeps the Rust rewrite prompt-aligned. Later scaffolding can exist,
 but a prompt is not accepted until its tests prove the contract named here.
 
-## Summary (2026-05-30)
+## Summary (2026-06-01)
 
 All core features are complete and production-ready:
-- **Prompts 00-28**: All passing with required tests
+- **Prompts 00-30**: All passing with required tests
 - **Issues #30-34**: All merged to main with full integration
+- **Issue #77**: Gateway request shape now reaches policy as selection signals
 - **Integration**: Pi and OpenCode configured and tested
 - **Gateway**: OpenAI-compatible inference endpoint live
 - **Telemetry**: SQLite event store recording all decisions
@@ -68,10 +69,22 @@ hardening when the local toolchain has the `clippy` component installed.
 | 27 durable event store | Optional SQLite history records decisions, snapshots, staging, action plans, and explanations. | `anemoi-telemetry`, `anemoi-daemon` | Passing |
 | 28 inference forwarding gateway | `POST /v1/chat/completions` maps model field to domain, runs decide, forwards to selected runtime, streams response. | `anemoi-daemon`, `anemoi-runtime`, `anemoi-core` | Passing |
 | 29 llama-swap residency events | Live `/api/events` SSE stream feeds observed model state into `inspect()` residents and drives staging completion without polling or false residency. | `anemoi-runtime`, `anemoi-daemon` | Passing |
+| 30 gateway selection signals | Gateway chat requests carry prompt/output estimates and explicit Anemoi metadata into policy, and policy enforces known context-window fit. | `anemoi-daemon`, `anemoi-policy` | Passing |
 
 ## Current Focus
 
-Build prompts 00-29 are passing. Prompt 29 (issue #62) subscribes to llama-swap's `/api/events` SSE stream so `inspect()` reports residents from observed model state and staging intents complete on real readiness. Prompt 28 (inference forwarding gateway) makes Anemoi an OpenAI-compatible endpoint for opencode: `POST /v1/chat/completions` treats the `model` field as a governance domain, runs `decide`, records telemetry, rewrites `model` to the selected runtime model, and streams the runtime response back with `X-Anemoi-Decision-Id`, `X-Anemoi-Selected-Model`, and `X-Anemoi-Action` headers. Mock forwarding works without `ANEMOI_ENABLE_LIVE_EXECUTE=1`; non-mock forwarding requires it.
+Build prompts 00-30 are passing. Prompt 30 (issue #77) makes gateway request shape a real policy input: `POST /v1/chat/completions` estimates prompt tokens from `messages`, carries `max_tokens`/`max_completion_tokens` as output estimates, accepts private `anemoi` selection metadata, strips that metadata before forwarding, and rejects known-too-small context-window candidates. Prompt 29 (issue #62) subscribes to llama-swap's `/api/events` SSE stream so `inspect()` reports residents from observed model state and staging intents complete on real readiness. Prompt 28 (inference forwarding gateway) makes Anemoi an OpenAI-compatible endpoint for opencode: `POST /v1/chat/completions` treats the `model` field as a governance domain, runs `decide`, records telemetry, rewrites `model` to the selected runtime model, and streams the runtime response back with `X-Anemoi-Decision-Id`, `X-Anemoi-Selected-Model`, and `X-Anemoi-Action` headers. Mock forwarding works without `ANEMOI_ENABLE_LIVE_EXECUTE=1`; non-mock forwarding requires it.
+
+Prompt 30 passed with:
+
+- `context_window_fit_rejects_candidate_too_small_for_request`
+- `context_window_fit_allows_unknown_request_size`
+- `context_window_explanation_names_required_and_available_tokens`
+- `inference_gateway_derives_prompt_tokens_estimate_from_messages`
+- `inference_gateway_uses_max_tokens_as_output_estimate`
+- `inference_gateway_accepts_anemoi_selection_metadata`
+- `inference_gateway_large_context_request_selects_larger_context_model`
+- `inference_gateway_strips_anemoi_metadata_before_forwarding`
 
 Issue #12 (resident transition emission) is complete: the reconciliation loop now diffs resident sets each tick and records every state change to the `resident_events` table through the `DecisionLog` trait, with a non-anonymous evidence source naming the adapter and reconciliation round. The event store stays optional (default no-op trait method; only SQLite persists transitions).
 
