@@ -1,12 +1,14 @@
-## Summary
+## What changed
+- 
 
--
+## Why
+- 
 
-## Validation
-
-- [ ] `dotnet build Anemoi.sln`
-- [ ] `dotnet test Anemoi.sln`
+## How to test
+- [ ] `cargo fmt --check`
+- [ ] `cargo clippy --workspace --all-targets -- -D warnings`
+- [ ] `cargo test --workspace`
+- [ ] Manual check: 
 
 ## Notes
-
 -

@@ -1,29 +1,27 @@
 ---
 name: Bug report
-about: Report a defect in Anemoi
-title: "[Bug] "
+about: A reproducible bug report
+title: "[BUG]<scope>: <short title>"
 labels: bug
-assignees: ""
+assignees: alucero270
+
 ---
 
 ## Summary
+What is broken? (one sentence: what broke and where)
 
-<!--
-One sentence: what broke and where.
--->
+## Steps to Reproduce
+1.
+2.
+3.
 
-## Steps To Reproduce
+## Expected Behavior
+What should happen?
 
-1. 
-2. 
-3. 
-
-## Expected Result
-
-## Actual Result
+## Actual Behavior
+What happens now? Include logs/errors.
 
 ## Environment
-
 - OS:
 - Rust toolchain (`rustup show`):
 - Anemoi config (`ANEMOI_CONFIG`):
@@ -38,3 +36,15 @@ Paste cargo test output, daemon logs, or CLI output. Redact tokens, hostnames, a
 
 ```
 ```
+
+## Scope
+Crates/areas likely involved.
+
+## Acceptance Criteria
+- [ ] Bug fixed and repro no longer fails
+- [ ] CI passes (`fmt` + `clippy` + `test` jobs green)
+- [ ] Regression test added (if appropriate)
+- [ ] Docs updated if behavior changed
+
+## Notes for Codex
+Any hints, constraints, or "do not touch" areas.
