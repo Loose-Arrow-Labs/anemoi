@@ -48,6 +48,11 @@ impl Scheduler {
             .map(|candidate| score_candidate(request, candidate, &self.config))
             .collect::<Vec<_>>();
 
+        // Highest score wins. This is a stable sort, so candidates whose scores
+        // tie keep their candidate-generation order: roster order, then the
+        // group's `models` order, then `supported_runtimes` order — all driven by
+        // config `Vec`s, so the tie-break is deterministic across runs. See the
+        // `decide_score_tie_*` tests, which pin this contract.
         candidates.sort_by_key(|candidate| Reverse(candidate.score.total));
 
         let Some(best) = candidates.first().cloned() else {
@@ -1429,6 +1434,91 @@ runtimes:
 "#,
         )
         .expect("candidate config")
+    }
+
+    // Two models with identical profiles in one keep-hot group; `model_order`
+    // controls the order they are listed (and therefore generated). When both
+    // are hot-resident they score identically, exercising the score-tie path.
+    fn tie_config_ordered(model_order: &str) -> AnemoiConfig {
+        let profile = "{ family: qwen, parameter_class: 9b, context_window: 32768, \
+             vram_required_mb: 9000, ram_required_mb: 12000, cold_load_estimate_ms: 18000, \
+             supported_runtimes: [mock] }";
+        let yaml = format!(
+            "domains:\n  coding:\n    rosters: [swarm]\n\
+             residency_groups:\n  swarm:\n    keep_hot: true\n    allow_background_load: true\n    models: {model_order}\n\
+             models:\n  alpha: {profile}\n  beta: {profile}\n\
+             runtimes:\n  mock:\n    adapter: mock\n"
+        );
+        serde_yaml::from_str(&yaml).expect("tie config")
+    }
+
+    fn both_hot_snapshot() -> RuntimeSnapshot {
+        let hot = |id: &str| ModelResident {
+            model_id: ModelId(id.to_string()),
+            state: ResidencyState::HotGpu,
+            vram_mb: Some(9000),
+            ram_mb: None,
+            kv_cache_mb: None,
+            loaded_since: None,
+        };
+        RuntimeSnapshot {
+            runtime_id: RuntimeId("mock".to_string()),
+            available: true,
+            residents: vec![hot("alpha"), hot("beta")],
+            configured_models: Vec::new(),
+            memory: RuntimeMemorySnapshot::default(),
+            active_requests: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn decide_score_tie_breaks_on_generation_order() {
+        let request = candidate_request();
+        let snapshots = [both_hot_snapshot()];
+
+        let alpha_first = Scheduler::new(tie_config_ordered("[alpha, beta]"))
+            .decide(&request, &snapshots)
+            .expect("decision");
+        let beta_first = Scheduler::new(tie_config_ordered("[beta, alpha]"))
+            .decide(&request, &snapshots)
+            .expect("decision");
+
+        // Identical profiles => identical scores, so the winner's score is the
+        // same regardless of order. This proves we are genuinely on the score-tie
+        // path rather than just picking the higher-scoring model.
+        assert_eq!(alpha_first.score.total, beta_first.score.total);
+        // The model listed first in the group wins the tie.
+        assert_eq!(
+            alpha_first.selected_model,
+            Some(ModelId("alpha".to_string()))
+        );
+        assert_eq!(beta_first.selected_model, Some(ModelId("beta".to_string())));
+    }
+
+    #[test]
+    fn decide_score_tie_winner_is_stable_across_invocations() {
+        let request = candidate_request();
+        let snapshots = [both_hot_snapshot()];
+        let scheduler = Scheduler::new(tie_config_ordered("[alpha, beta]"));
+
+        let winners: std::collections::HashSet<_> = (0..32)
+            .map(|_| {
+                scheduler
+                    .decide(&request, &snapshots)
+                    .expect("decision")
+                    .selected_model
+            })
+            .collect();
+
+        assert_eq!(
+            winners.len(),
+            1,
+            "score-tie winner must be deterministic across invocations, saw {winners:?}"
+        );
+        assert_eq!(
+            winners.into_iter().next().unwrap(),
+            Some(ModelId("alpha".to_string()))
+        );
     }
 
     #[test]
