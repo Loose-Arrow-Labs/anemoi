@@ -1,6 +1,6 @@
 # Anemoi Test Roadmap
 
-**Current Status**: **30/30 Prompts Complete and Passing**
+**Current Status**: **31/31 Prompts Complete and Passing**
 
 This roadmap keeps the Rust rewrite prompt-aligned. Later scaffolding can exist,
 but a prompt is not accepted until its tests prove the contract named here.
@@ -8,7 +8,7 @@ but a prompt is not accepted until its tests prove the contract named here.
 ## Summary (2026-06-01)
 
 All core features are complete and production-ready:
-- **Prompts 00-30**: All passing with required tests
+- **Prompts 00-31**: All passing with required tests
 - **Issues #30-34**: All merged to main with full integration
 - **Issue #77**: Gateway request shape now reaches policy as selection signals
 - **Integration**: Pi and OpenCode configured and tested
@@ -70,10 +70,36 @@ hardening when the local toolchain has the `clippy` component installed.
 | 28 inference forwarding gateway | `POST /v1/chat/completions` maps model field to domain, runs decide, forwards to selected runtime, streams response. | `anemoi-daemon`, `anemoi-runtime`, `anemoi-core` | Passing |
 | 29 llama-swap residency events | Live `/api/events` SSE stream feeds observed model state into `inspect()` residents and drives staging completion without polling or false residency. | `anemoi-runtime`, `anemoi-daemon` | Passing |
 | 30 gateway selection signals | Gateway chat requests carry prompt/output estimates and explicit Anemoi metadata into policy, and policy enforces known context-window fit. | `anemoi-daemon`, `anemoi-policy` | Passing |
+| 31 concurrent transition coordination | Concurrent/multi-instance residency transition collisions are arbitrated deterministically (join, deterministic winner, hot fallback, gated staging, expired-owner take-over, runtime-unavailable) with code-enforced lease/fencing and a structured explanation. | `anemoi-policy`, `anemoi-core` | Passing |
 
 ## Current Focus
 
 Build prompts 00-30 are passing. Prompt 30 (issue #77) makes gateway request shape a real policy input: `POST /v1/chat/completions` estimates prompt tokens from `messages`, carries `max_tokens`/`max_completion_tokens` as output estimates, accepts private `anemoi` selection metadata, strips that metadata before forwarding, and rejects known-too-small context-window candidates. Prompt 29 (issue #62) subscribes to llama-swap's `/api/events` SSE stream so `inspect()` reports residents from observed model state and staging intents complete on real readiness. Prompt 28 (inference forwarding gateway) makes Anemoi an OpenAI-compatible endpoint for opencode: `POST /v1/chat/completions` treats the `model` field as a governance domain, runs `decide`, records telemetry, rewrites `model` to the selected runtime model, and streams the runtime response back with `X-Anemoi-Decision-Id`, `X-Anemoi-Selected-Model`, and `X-Anemoi-Action` headers. Mock forwarding works without `ANEMOI_ENABLE_LIVE_EXECUTE=1`; non-mock forwarding requires it.
+
+Prompt 31 (issue #79) adds concurrent residency transition coordination: a
+`TransitionCoordinator` in `anemoi-policy` arbitrates collisions when concurrent
+requests — possibly from multiple Anemoi instances — want incompatible residency
+states for the same runtime. It joins same-model requests, picks a deterministic
+winner for conflicting models, falls back to a hot worker for interactive
+requests during a collision, gates background staging behind active leases, takes
+over expired-owner transitions with an advanced fencing token, and rejects
+unavailable-runtime requests — every path carrying a structured explanation
+(reasons + rejected options). Multi-instance ownership is code-enforced: a stale
+fencing token cannot complete a taken-over transition. It is control-plane policy
+only — it never loads a model. Daemon `/decide` wiring is a tracked follow-up.
+
+Prompt 31 passed with:
+
+- `same_model_request_joins_existing_transition`
+- `conflicting_models_pick_deterministic_winner`
+- `interactive_collision_falls_back_to_hot_worker`
+- `background_stage_allowed_when_no_active_transition`
+- `background_stage_blocked_by_active_conflicting_transition`
+- `expired_owner_lease_is_taken_over_with_new_fencing_token`
+- `stale_owner_cannot_complete_after_takeover`
+- `serving_lease_protects_active_transition_from_preemption`
+- `unavailable_runtime_request_is_rejected_deterministically`
+- `every_transition_decision_carries_explanation`
 
 Prompt 30 passed with:
 

@@ -10,11 +10,15 @@ use uuid::Uuid;
 
 mod eviction;
 mod pressure;
+mod transition;
 pub use eviction::{
     plan_evictions, BlockedEviction, EvictionCandidate, EvictionCandidateResident, EvictionPlan,
     EvictionRequest, ProtectedResident,
 };
 pub use pressure::{Pressure, PressureAssessment, PressureInputs, PressureModel, PressureReason};
+pub use transition::{
+    ActiveTransition, TransitionCoordinator, TransitionDecision, TransitionPath, TransitionRequest,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum PolicyError {
