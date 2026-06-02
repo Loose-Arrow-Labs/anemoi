@@ -338,7 +338,9 @@ impl LlamaCppAdapter {
         Ok(response
             .data
             .into_iter()
-            .map(|model| normalize_model_id(&model.id))
+            // Skip models whose id normalizes to empty; a runtime reporting a
+            // blank id is malformed and must not yield an empty ModelId.
+            .filter_map(|model| normalize_model_id(&model.id).ok())
             .collect())
     }
 
@@ -541,7 +543,9 @@ impl LlamaSwapAdapter {
         Ok(response
             .data
             .into_iter()
-            .map(|model| normalize_model_id(&model.id))
+            // Skip models whose id normalizes to empty; a runtime reporting a
+            // blank id is malformed and must not yield an empty ModelId.
+            .filter_map(|model| normalize_model_id(&model.id).ok())
             .collect())
     }
 
@@ -901,8 +905,11 @@ fn residents_from_states(states: &HashMap<String, LlamaSwapModelState>) -> Vec<M
     let mut residents: Vec<ModelResident> = states
         .iter()
         .filter_map(|(name, state)| {
-            state.residency().map(|residency| ModelResident {
-                model_id: normalize_model_id(name),
+            let residency = state.residency()?;
+            // Drop residents whose id normalizes to empty (malformed runtime data).
+            let model_id = normalize_model_id(name).ok()?;
+            Some(ModelResident {
+                model_id,
                 state: residency,
                 vram_mb: None,
                 ram_mb: None,
@@ -1119,15 +1126,25 @@ fn bytes_to_mb(bytes: u64) -> u64 {
     bytes / 1024 / 1024
 }
 
-fn normalize_model_id(raw: &str) -> ModelId {
-    let leaf = raw.replace('\\', "/");
-    let leaf = leaf.rsplit('/').next().unwrap_or(raw);
-    ModelId(
-        leaf.strip_suffix(".gguf")
-            .or_else(|| leaf.strip_suffix(".bin"))
-            .unwrap_or(leaf)
-            .to_string(),
-    )
+/// Normalizes a runtime-reported model identifier to a bare model id: strips any
+/// directory prefix (handling both `/` and `\` separators) and a trailing
+/// `.gguf`/`.bin` extension.
+///
+/// Returns [`RuntimeError::Url`] for an id that normalizes to empty (`""`,
+/// `"models/"`, `"weights\\"`, …). A runtime that reports a model with no usable
+/// id is malformed; callers skip such entries so an empty `ModelId` never
+/// propagates into scheduling, logging, and telemetry.
+fn normalize_model_id(raw: &str) -> Result<ModelId, RuntimeError> {
+    let normalized = raw.replace('\\', "/");
+    let leaf = normalized.rsplit('/').next().unwrap_or(&normalized);
+    let leaf = leaf
+        .strip_suffix(".gguf")
+        .or_else(|| leaf.strip_suffix(".bin"))
+        .unwrap_or(leaf);
+    if leaf.is_empty() {
+        return Err(RuntimeError::Url(format!("empty model id (raw: {raw:?})")));
+    }
+    Ok(ModelId(leaf.to_string()))
 }
 
 /// Where a forwarded chat completion should go. `auth_token` originates from
@@ -1486,6 +1503,48 @@ mod tests {
                 ModelId("granite8b".to_string())
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn llama_swap_models_response_skips_empty_model_ids() {
+        let server = spawn_fixture(vec![http_response(
+            200,
+            r#"{"data":[{"id":""},{"id":"models/qwen9b.gguf"},{"id":"models/"}]}"#,
+        )])
+        .await;
+        let adapter = LlamaSwapAdapter::new(RuntimeId("llama_swap".to_string()), &server.base_url)
+            .expect("adapter");
+
+        let models = adapter.inspect_models().await.expect("models");
+
+        // The empty id and the directory-only "models/" id (which normalizes to
+        // empty) are dropped; only the valid model survives.
+        assert_eq!(models, vec![ModelId("qwen9b".to_string())]);
+    }
+
+    #[test]
+    fn normalize_model_id_strips_path_and_extension() {
+        assert_eq!(
+            normalize_model_id("models/qwen9b.gguf").expect("id"),
+            ModelId("qwen9b".to_string())
+        );
+        assert_eq!(
+            normalize_model_id(r"weights\granite8b.bin").expect("id"),
+            ModelId("granite8b".to_string())
+        );
+    }
+
+    #[test]
+    fn normalize_model_id_rejects_empty_input() {
+        // A runtime reporting a model with no usable id is malformed; an empty id
+        // must be rejected rather than yielding ModelId("").
+        let err = normalize_model_id("").expect_err("empty id must be rejected");
+        assert!(
+            err.to_string().contains("empty model id"),
+            "unexpected error: {err}"
+        );
+        assert!(normalize_model_id("models/").is_err());
+        assert!(normalize_model_id(r"weights\").is_err());
     }
 
     #[tokio::test]
