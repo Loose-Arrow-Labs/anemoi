@@ -8,6 +8,7 @@
 //! controlled execution path to act on.
 
 use anemoi_core::{DecisionReason, ModelId, ResidencyState, RuntimeId};
+use std::cmp::Ordering;
 
 /// A resident under consideration for eviction, with the policy-relevant flags
 /// already resolved from config and runtime state.
@@ -137,12 +138,20 @@ pub fn plan_evictions(request: &EvictionRequest<'_>) -> EvictionPlan {
 
     // Prefer the most idle candidate first; unknown idle ranks last. Ties break
     // on model id for determinism.
+    //
+    // Known idle always ranks ahead of unknown idle, and among known residents a
+    // higher `idle_secs` (a better eviction candidate) comes first. A previous
+    // `unwrap_or(0)` key tied `None` with `Some(0)`, which let the alphabetical
+    // model-id tiebreak surface an unknown-idle resident ahead of a known
+    // zero-idle one — contradicting "unknown idle ranks last".
     plan.candidates.sort_by(|a, b| {
-        let a_key = a.idle_secs.unwrap_or(0);
-        let b_key = b.idle_secs.unwrap_or(0);
-        b_key
-            .cmp(&a_key)
-            .then_with(|| a.model_id.to_string().cmp(&b.model_id.to_string()))
+        match (a.idle_secs, b.idle_secs) {
+            (Some(x), Some(y)) => y.cmp(&x),
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (None, None) => Ordering::Equal,
+        }
+        .then_with(|| a.model_id.to_string().cmp(&b.model_id.to_string()))
     });
 
     plan
