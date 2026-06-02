@@ -255,11 +255,15 @@ impl RuntimeAdapter for OllamaAdapter {
         })
     }
 
-    async fn load_model(&self, model: &ModelId) -> Result<LoadHandle, RuntimeError> {
-        Ok(LoadHandle {
-            id: Uuid::new_v4(),
-            model_id: model.clone(),
-        })
+    /// Ollama loads a model into memory lazily on its first inference request,
+    /// and weight downloads happen via an explicit `ollama pull` outside Anemoi's
+    /// control plane. Anemoi decides residency; it does not mutate runtime
+    /// infrastructure (AGENTS.md §2/§4), so it does not proactively load Ollama
+    /// models. Returning `Unsupported` (rather than a fabricated `LoadHandle`)
+    /// keeps staging honest: the worker observes that the load did not happen
+    /// instead of marking the intent `Completed` for a load that never ran.
+    async fn load_model(&self, _model: &ModelId) -> Result<LoadHandle, RuntimeError> {
+        Err(RuntimeError::Unsupported("ollama load"))
     }
 
     async fn unload_model(&self, _model: &ModelId) -> Result<(), RuntimeError> {
@@ -1863,6 +1867,25 @@ mod tests {
 
         assert_eq!(snapshot.residents.len(), 1);
         assert_eq!(snapshot.residents[0].state, ResidencyState::HotGpu);
+    }
+
+    #[tokio::test]
+    async fn ollama_load_model_is_unsupported() {
+        // Ollama loads lazily on first inference; Anemoi does not proactively
+        // load it. load_model must report Unsupported (not a fake LoadHandle) so
+        // staging does not mark an intent Completed for a load that never ran.
+        let adapter = OllamaAdapter::new(RuntimeId("ollama".to_string()), "http://localhost:11434")
+            .expect("adapter");
+
+        let error = adapter
+            .load_model(&ModelId("qwen9b".to_string()))
+            .await
+            .expect_err("ollama load must be unsupported");
+
+        assert_eq!(
+            error.to_string(),
+            "runtime operation is not supported: ollama load"
+        );
     }
 
     #[tokio::test]
