@@ -385,6 +385,37 @@ impl StagingWorker {
         reason: String,
         pending_context: Option<String>,
     ) {
+        self.queue_intent(
+            decision_id,
+            foreground_model,
+            background_model,
+            target_runtime,
+            reason,
+            pending_context,
+            true,
+        )
+        .await;
+    }
+
+    /// Queues a staging intent, marking it runnable (`Pending`) when `runnable`
+    /// is true and leaving it `Blocked` otherwise. A recommended stage against a
+    /// *live* runtime is recorded but reported as `Blocked` until live execution
+    /// is explicitly enabled (`ANEMOI_ENABLE_LIVE_EXECUTE=1`); only a mock runtime
+    /// (or the gate being open) makes it immediately runnable. The decision and
+    /// the intent are recorded regardless — only the runnability flag changes.
+    // Arguments mirror StagingIntent's fields plus the runnability gate; bundling
+    // them into a struct would only move the sprawl to the call site.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn queue_intent(
+        &self,
+        decision_id: Uuid,
+        foreground_model: Option<ModelId>,
+        background_model: ModelId,
+        target_runtime: RuntimeId,
+        reason: String,
+        pending_context: Option<String>,
+        runnable: bool,
+    ) {
         let mut intent = StagingIntent::new(
             decision_id,
             foreground_model,
@@ -393,7 +424,17 @@ impl StagingWorker {
             reason,
         );
         intent.pending_context = pending_context;
-        intent.mark_pending();
+        if runnable {
+            intent.mark_pending();
+        } else {
+            // Recorded but gated: leave the intent Blocked (its initial state) and
+            // note why, so /staging explains it instead of showing a ready-to-run
+            // intent that execute_pending/run_staging_tick would refuse anyway.
+            intent.last_error = Some(
+                "blocked: target runtime is not mock and ANEMOI_ENABLE_LIVE_EXECUTE is not set"
+                    .to_string(),
+            );
+        }
         self.enqueue(intent).await;
     }
 
@@ -1000,14 +1041,21 @@ impl AppState {
                     .escalation_intent
                     .as_ref()
                     .and_then(|intent| intent.context.clone());
+                // Gate runnability: a background load mutates a live runtime, so
+                // a stage against a non-mock runtime is only runnable when
+                // ANEMOI_ENABLE_LIVE_EXECUTE=1. Otherwise it is recorded but
+                // reported as Blocked rather than queued ready-to-run.
+                let is_mock = self.runtime_adapter_type(&runtime_id.0) == Some("mock");
+                let runnable = is_mock || self.live_execute_enabled();
                 self.staging_worker
-                    .unblock_and_queue(
+                    .queue_intent(
                         decision.id,
                         decision.selected_model.clone(),
                         model_id.clone(),
                         runtime_id.clone(),
                         reason,
                         pending_context,
+                        runnable,
                     )
                     .await;
             }
@@ -2214,6 +2262,129 @@ mod tests {
         assert!(
             !intents.is_empty(),
             "StageBackground decision should enqueue staging intent"
+        );
+    }
+
+    // A non-mock-typed runtime ("llama_swap") that with_mock_residents backs with
+    // a MockRuntimeAdapter (only "ollama" becomes a real adapter), holding a hot
+    // small worker. The large model is cold, so decide() stages it in the
+    // background on this runtime — exercising the queue-time live-execute gate.
+    fn stage_background_state_on_live_runtime(live_execute: bool) -> AppState {
+        let yaml = r#"
+domains:
+  coding:
+    rosters: [small_swarm, large_models]
+residency_groups:
+  small_swarm:
+    purpose: [test]
+    keep_hot: true
+    allow_background_load: true
+    models: [qwen9b]
+  large_models:
+    purpose: [test]
+    keep_hot: false
+    allow_background_load: true
+    models: [qwen35_a3b]
+models:
+  qwen9b:
+    family: qwen
+    parameter_class: 9b
+    context_window: 32768
+    vram_required_mb: 9000
+    ram_required_mb: 12000
+    cold_load_estimate_ms: 18000
+    supported_runtimes: [live_rt]
+  qwen35_a3b:
+    family: qwen
+    parameter_class: 35b
+    context_window: 32768
+    vram_required_mb: 30000
+    ram_required_mb: 45000
+    cold_load_estimate_ms: 45000
+    supported_runtimes: [live_rt]
+runtimes:
+  live_rt:
+    adapter: llama_swap
+    base_url: http://127.0.0.1:9
+continuity:
+  keep_small_worker_hot: true
+  background_load: true
+  max_blank_wait_ms: 1500
+  prefer_degraded_response_over_silence: true
+"#;
+        let config = AnemoiConfig::from_yaml_str(yaml).expect("live-runtime config");
+        let residents = HashMap::from([(
+            "live_rt".to_string(),
+            vec![ModelResident {
+                model_id: ModelId("qwen9b".to_string()),
+                state: ResidencyState::HotGpu,
+                vram_mb: Some(9000),
+                ram_mb: Some(12000),
+                kv_cache_mb: None,
+                loaded_since: None,
+            }],
+        )]);
+        AppState::with_mock_residents(config, residents)
+            .expect("state")
+            .with_live_execute(live_execute)
+    }
+
+    #[tokio::test]
+    async fn stage_against_mock_runtime_is_runnable() {
+        let mut config = example_config();
+        config.continuity.background_load = true;
+        config.continuity.keep_small_worker_hot = true;
+        let state = AppState::new(config, Arc::new(InMemoryDecisionLog::default())).expect("state");
+
+        let decision = state.decide(&sample_request()).await.expect("decision");
+        assert_eq!(decision.action, DecisionAction::StageBackground);
+
+        let intents = state.staging_worker().get_all().await;
+        assert_eq!(intents.len(), 1);
+        assert_eq!(
+            intents[0].state,
+            StagingState::Pending,
+            "a stage against a mock runtime is immediately runnable"
+        );
+    }
+
+    #[tokio::test]
+    async fn stage_against_live_runtime_without_flag_is_blocked() {
+        let state = stage_background_state_on_live_runtime(false);
+
+        let decision = state.decide(&sample_request()).await.expect("decision");
+        assert_eq!(decision.action, DecisionAction::StageBackground);
+
+        let intents = state.staging_worker().get_all().await;
+        assert_eq!(intents.len(), 1);
+        assert_eq!(
+            intents[0].state,
+            StagingState::Blocked,
+            "a stage against a live runtime must be blocked without ANEMOI_ENABLE_LIVE_EXECUTE"
+        );
+        let reason = intents[0]
+            .last_error
+            .as_deref()
+            .expect("a blocked intent should explain the gate");
+        assert!(
+            reason.contains("ANEMOI_ENABLE_LIVE_EXECUTE"),
+            "block reason should name the gate, got: {reason}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stage_against_live_runtime_with_flag_is_runnable() {
+        let state = stage_background_state_on_live_runtime(true);
+
+        let decision = state.decide(&sample_request()).await.expect("decision");
+        assert_eq!(decision.action, DecisionAction::StageBackground);
+
+        let intents = state.staging_worker().get_all().await;
+        assert_eq!(intents.len(), 1);
+        assert_eq!(
+            intents[0].state,
+            StagingState::Pending,
+            "enabling live execution makes the live-runtime stage runnable"
         );
     }
 
