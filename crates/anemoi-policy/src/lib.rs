@@ -292,6 +292,15 @@ impl ScoredCandidate {
         request: &InferenceRequest,
         rejected_options: Vec<RejectedOption>,
     ) -> Decision {
+        // A StageBackground decision must always carry the model it is staging.
+        // `decide` only ever pairs the two, so the `_` arm below would otherwise
+        // emit a generic "with action StageBackground" summary that silently
+        // dropped the staged model if a future caller forgot to set it.
+        debug_assert!(
+            !matches!(self.action, DecisionAction::StageBackground)
+                || self.background_model.is_some(),
+            "StageBackground decision must carry a background_model"
+        );
         let summary = match (&self.action, &self.background_model) {
             (DecisionAction::StageBackground, Some(background)) => format!(
                 "Selected {} via {} and staged {} to avoid an interactive cold-load wait.",
@@ -1006,6 +1015,49 @@ continuity:
         assert!(continuity_reason
             .detail
             .contains("prefers degraded response over silence"));
+    }
+
+    // debug_assert is compiled out under --release, so this invariant test only
+    // runs when debug assertions are active (the default for `cargo test`).
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "StageBackground decision must carry a background_model")]
+    fn into_decision_panics_on_stage_background_without_model() {
+        // (StageBackground, None) is unreachable from decide(), which always
+        // pairs a staging action with a background model. The debug_assert pins
+        // that invariant so the generic `_` summary arm can't silently swallow a
+        // staging decision that forgot to record its staged model.
+        let candidate = Candidate {
+            action: DecisionAction::StageBackground,
+            model_id: ModelId("qwen9b".to_string()),
+            runtime_id: RuntimeId("mock".to_string()),
+            group_id: ResidencyGroupId("small_swarm".to_string()),
+            model_profile: ModelProfile {
+                id: ModelId("qwen9b".to_string()),
+                family: "qwen".to_string(),
+                parameter_class: "9b".to_string(),
+                context_window: None,
+                vram_required_mb: None,
+                ram_required_mb: None,
+                cold_load_estimate_ms: None,
+                supported_runtimes: vec![RuntimeId("mock".to_string())],
+                supports_streaming: None,
+            },
+            residency_state: ResidencyState::HotGpu,
+            load_estimate_ms: 0,
+            runtime_memory: RuntimeMemorySnapshot::default(),
+            active_request_count: 0,
+            group_keep_hot: false,
+        };
+        let scored = ScoredCandidate {
+            action: DecisionAction::StageBackground,
+            candidate,
+            background_model: None,
+            score: DecisionScore::default(),
+            reasons: Vec::new(),
+        };
+
+        let _ = scored.into_decision(&candidate_request(), Vec::new());
     }
 
     #[test]
