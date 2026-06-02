@@ -395,7 +395,18 @@ impl RuntimeAdapter for LlamaCppAdapter {
             });
         }
 
-        let configured_models = self.inspect_models().await?;
+        // Health passed but the model-listing endpoint can be flaky (500 or
+        // timeout). The runtime is up, so report it available with no configured
+        // models rather than treating a partial failure as a hard outage — that
+        // would hide a healthy runtime from the scheduling path entirely.
+        let configured_models = self.inspect_models().await.unwrap_or_else(|error| {
+            tracing::warn!(
+                runtime = %self.id,
+                %error,
+                "model listing failed after a healthy /health probe; reporting available with no configured models"
+            );
+            Vec::new()
+        });
 
         Ok(RuntimeSnapshot {
             runtime_id: self.id.clone(),
@@ -1006,7 +1017,18 @@ impl RuntimeAdapter for LlamaSwapAdapter {
             });
         }
 
-        let configured_models = self.inspect_models().await?;
+        // Health passed but the model-listing endpoint can be flaky (500 or
+        // timeout). The runtime is up, so report it available with no configured
+        // models rather than treating a partial failure as a hard outage — that
+        // would hide a healthy runtime from the scheduling path entirely.
+        let configured_models = self.inspect_models().await.unwrap_or_else(|error| {
+            tracing::warn!(
+                runtime = %self.id,
+                %error,
+                "model listing failed after a healthy /health probe; reporting available with no configured models"
+            );
+            Vec::new()
+        });
         let residents = {
             let states = self
                 .model_states
@@ -1482,6 +1504,54 @@ mod tests {
 
         assert!(!snapshot.available);
         assert!(snapshot.residents.is_empty());
+    }
+
+    #[tokio::test]
+    async fn llama_swap_inspect_tolerates_flaky_models_endpoint() {
+        // /health succeeds but /v1/models returns 500. The runtime is healthy, so
+        // inspect must report it available with no configured models rather than
+        // propagating the error (which would make it look like a hard outage).
+        let server = spawn_fixture(vec![
+            http_response(200, "{}"), // /health ok
+            http_response(500, "{}"), // /v1/models fails
+        ])
+        .await;
+        let adapter = LlamaSwapAdapter::new(RuntimeId("llama_swap".to_string()), &server.base_url)
+            .expect("adapter");
+
+        let snapshot = adapter
+            .inspect()
+            .await
+            .expect("healthy runtime with flaky /v1/models must still inspect");
+
+        assert!(snapshot.available, "healthy runtime must stay available");
+        assert!(
+            snapshot.configured_models.is_empty(),
+            "a failed /v1/models yields no configured models"
+        );
+        assert!(snapshot.residents.is_empty());
+    }
+
+    #[tokio::test]
+    async fn llama_cpp_inspect_tolerates_flaky_models_endpoint() {
+        let server = spawn_fixture(vec![
+            http_response(200, "{}"), // /health ok
+            http_response(500, "{}"), // /v1/models fails
+        ])
+        .await;
+        let adapter = LlamaCppAdapter::new(RuntimeId("llama_cpp".to_string()), &server.base_url)
+            .expect("adapter");
+
+        let snapshot = adapter
+            .inspect()
+            .await
+            .expect("healthy runtime with flaky /v1/models must still inspect");
+
+        assert!(snapshot.available, "healthy runtime must stay available");
+        assert!(
+            snapshot.configured_models.is_empty(),
+            "a failed /v1/models yields no configured models"
+        );
     }
 
     #[tokio::test]
