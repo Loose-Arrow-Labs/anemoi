@@ -79,10 +79,10 @@ pub struct PressureModel {
     pub high_penalty: i32,
     /// Penalty applied to a cold-load candidate under elevated pressure.
     pub elevated_penalty: i32,
-    /// Penalty applied per active request on the target runtime.
+    /// Penalty applied per active request on the target runtime. The cumulative
+    /// active-request penalty is linear in the request count (`each * count`) so
+    /// a busier runtime always scores lower than a less busy one.
     pub active_request_penalty_each: i32,
-    /// Floor for the cumulative active-request penalty.
-    pub active_request_penalty_floor: i32,
 }
 
 impl Default for PressureModel {
@@ -93,7 +93,6 @@ impl Default for PressureModel {
             high_penalty: -25,
             elevated_penalty: -10,
             active_request_penalty_each: -5,
-            active_request_penalty_floor: -20,
         }
     }
 }
@@ -186,11 +185,10 @@ impl PressureModel {
     }
 
     fn active_request_reason(&self, count: usize, reasons: &mut Vec<PressureReason>) -> i32 {
-        let impact = if count == 0 {
-            0
-        } else {
-            (self.active_request_penalty_each * count as i32).max(self.active_request_penalty_floor)
-        };
+        // Linear in the request count: a runtime serving more requests is always
+        // penalized more. A previous `.max(floor)` capped this at the floor, so
+        // counts beyond the floor/each boundary all scored identically.
+        let impact = self.active_request_penalty_each * count as i32;
         reasons.push(PressureReason {
             code: "pressure.active_requests".to_string(),
             detail: format!("runtime is serving {count} active request(s)"),
