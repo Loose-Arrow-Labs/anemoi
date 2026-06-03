@@ -601,14 +601,52 @@ impl AnemoiConfig {
     }
 }
 
-static ENV_VAR_RE: LazyLock<regex::Regex> =
-    LazyLock::new(|| regex::Regex::new(r"\$\{([^}]+)\}").expect("env var regex"));
+static ENV_VAR_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    // Either a braced reference `${...}` (whose body may carry a `:-`/`:+`
+    // modifier) or a bare `$VAR` whose name is a standard identifier.
+    regex::Regex::new(r"\$\{([^}]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)").expect("env var regex")
+});
 
+/// Expands environment-variable references in `text` before YAML parsing.
+///
+/// Supported forms:
+/// - `${VAR}` / `$VAR` — replaced with the value of `VAR`. A bare `$VAR` name is
+///   `[A-Za-z_][A-Za-z0-9_]*`.
+/// - `${VAR:-default}` — the value of `VAR` if set and non-empty, else `default`.
+/// - `${VAR:+alt}` — `alt` if `VAR` is set and non-empty, else the empty string.
+///
+/// A plain `${VAR}` / `$VAR` whose variable is unset is left **verbatim** (e.g.
+/// `${MISSING}` stays `${MISSING}`) so a missing value is visible in the parsed
+/// config rather than silently becoming empty. The `:-` / `:+` forms always
+/// resolve — supplying a default is the whole point.
+///
+/// Not supported: nested references (expansion is a single left-to-right pass,
+/// so `${${INNER}}` is not resolved inner-first) and `$$` escaping. Keep config
+/// references to the forms listed above.
 fn expand_env_vars(text: &str) -> String {
     ENV_VAR_RE
         .replace_all(text, |captures: &regex::Captures| {
-            let var_name = &captures[1];
-            std::env::var(var_name).unwrap_or_else(|_| captures[0].to_string())
+            // Bare `$VAR`: expand if set, else preserve the literal.
+            if let Some(bare) = captures.get(2) {
+                return std::env::var(bare.as_str()).unwrap_or_else(|_| captures[0].to_string());
+            }
+
+            // Braced `${...}`, possibly with a `:-` / `:+` modifier.
+            let inner = &captures[1];
+            if let Some((name, default)) = inner.split_once(":-") {
+                match std::env::var(name) {
+                    Ok(value) if !value.is_empty() => value,
+                    _ => default.to_string(),
+                }
+            } else if let Some((name, alt)) = inner.split_once(":+") {
+                match std::env::var(name) {
+                    Ok(value) if !value.is_empty() => alt.to_string(),
+                    _ => String::new(),
+                }
+            } else {
+                // Plain `${VAR}`: expand if set, else preserve the literal.
+                std::env::var(inner).unwrap_or_else(|_| captures[0].to_string())
+            }
         })
         .into_owned()
 }
@@ -1173,6 +1211,47 @@ runtimes:
                 .auth_token,
             Some("${ANEMOI_LLAMA_SWAP_AUTH_TOKEN}".to_string())
         );
+    }
+
+    #[test]
+    fn expand_env_vars_expands_set_variable() {
+        std::env::set_var("ANEMOI_TEST_EXPAND_SET", "swift");
+        // Both the braced and the bare form expand to the variable's value.
+        assert_eq!(expand_env_vars("a=${ANEMOI_TEST_EXPAND_SET}"), "a=swift");
+        assert_eq!(expand_env_vars("a=$ANEMOI_TEST_EXPAND_SET/b"), "a=swift/b");
+        std::env::remove_var("ANEMOI_TEST_EXPAND_SET");
+    }
+
+    #[test]
+    fn expand_env_vars_preserves_unset_variable_literally() {
+        // Unset variables stay verbatim so a missing value surfaces in the parsed
+        // config instead of silently collapsing to an empty string.
+        assert_eq!(
+            expand_env_vars("t=${ANEMOI_TEST_EXPAND_MISSING}"),
+            "t=${ANEMOI_TEST_EXPAND_MISSING}"
+        );
+        assert_eq!(
+            expand_env_vars("t=$ANEMOI_TEST_EXPAND_MISSING"),
+            "t=$ANEMOI_TEST_EXPAND_MISSING"
+        );
+    }
+
+    #[test]
+    fn expand_env_vars_resolves_default_and_alternate_forms() {
+        std::env::set_var("ANEMOI_TEST_EXPAND_PRESENT", "yes");
+        // `:-` yields the value when set, the default when unset.
+        assert_eq!(
+            expand_env_vars("${ANEMOI_TEST_EXPAND_PRESENT:-fallback}"),
+            "yes"
+        );
+        assert_eq!(
+            expand_env_vars("${ANEMOI_TEST_EXPAND_ABSENT:-fallback}"),
+            "fallback"
+        );
+        // `:+` yields the alternate when set, the empty string when unset.
+        assert_eq!(expand_env_vars("${ANEMOI_TEST_EXPAND_PRESENT:+alt}"), "alt");
+        assert_eq!(expand_env_vars("${ANEMOI_TEST_EXPAND_ABSENT:+alt}"), "");
+        std::env::remove_var("ANEMOI_TEST_EXPAND_PRESENT");
     }
 
     #[test]

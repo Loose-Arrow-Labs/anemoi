@@ -94,11 +94,25 @@ impl Reconciler {
 
     pub async fn record_error(&self, runtime_id: &str, error: String) {
         let mut cache = self.cache.write().await;
-        let runtime_id_obj = RuntimeId(runtime_id.to_string());
-        cache.insert(
-            runtime_id.to_string(),
-            ReconciledSnapshot::from_error(runtime_id_obj, error),
-        );
+        match cache.get_mut(runtime_id) {
+            // A transient inspect failure must not erase the last observed state.
+            // Keep the prior snapshot (and its `last_inspected`, the last
+            // *successful* inspection), but flag it stale and attach the error so
+            // /residents and decide() see the last good state plus an explicit
+            // staleness/error marker rather than a synthetic empty one.
+            Some(existing) => {
+                existing.is_stale = true;
+                existing.last_error = Some(error);
+            }
+            // No prior snapshot: the initial entry is the unavailable placeholder.
+            None => {
+                let runtime_id_obj = RuntimeId(runtime_id.to_string());
+                cache.insert(
+                    runtime_id.to_string(),
+                    ReconciledSnapshot::from_error(runtime_id_obj, error),
+                );
+            }
+        }
     }
 
     pub async fn mark_stale(&self) {
@@ -250,6 +264,17 @@ pub struct StagingIntent {
     pub created_at: DateTime<Utc>,
     pub state: StagingState,
     pub last_error: Option<String>,
+    /// Number of staging-tick attempts for this intent, whether the load fired
+    /// or was skipped by the live-execute gate. Lets an operator see that a
+    /// pending intent is being re-evaluated each tick rather than stuck.
+    #[serde(default)]
+    pub attempt_count: u32,
+    /// Why the most recent staging tick did not run the load (e.g. the
+    /// live-execute gate is closed for a non-mock runtime). Cleared to `None`
+    /// once a load is actually attempted. Surfaced via the `/staging` endpoint so
+    /// a growing `staging.pending` always carries an explanation.
+    #[serde(default)]
+    pub last_skip_reason: Option<String>,
     /// Context payload declared via `escalation_intent` at decision time, held
     /// until the foreground model is evicted. On the eviction signal it is
     /// written to the [`EscalationContextCache`], `context_ref` is set, and this
@@ -282,6 +307,8 @@ impl StagingIntent {
             created_at: Utc::now(),
             state: StagingState::Blocked,
             last_error: None,
+            attempt_count: 0,
+            last_skip_reason: None,
             pending_context: None,
             context_ref: None,
         }
@@ -289,6 +316,14 @@ impl StagingIntent {
 
     pub fn mark_pending(&mut self) {
         self.state = StagingState::Pending;
+    }
+
+    /// Records that a staging tick processed this intent without changing its
+    /// state: bumps `attempt_count` and sets `last_skip_reason` (`Some` when the
+    /// tick skipped the load, `None` when a load was actually attempted).
+    pub fn note_tick(&mut self, skip_reason: Option<String>) {
+        self.attempt_count += 1;
+        self.last_skip_reason = skip_reason;
     }
 
     pub fn mark_completed(&mut self) {
@@ -350,6 +385,16 @@ impl StagingWorker {
         }
     }
 
+    /// Records a staging-tick attempt against an intent without changing its
+    /// state (see [`StagingIntent::note_tick`]). `skip_reason` is `Some` when the
+    /// tick skipped the load and `None` when a load was attempted.
+    pub async fn note_tick(&self, intent_id: Uuid, skip_reason: Option<String>) {
+        let mut queue = self.queue.write().await;
+        if let Some(intent) = queue.iter_mut().find(|i| i.id == intent_id) {
+            intent.note_tick(skip_reason);
+        }
+    }
+
     pub async fn execute_pending(&self, runtime: &DynRuntimeAdapter) -> anyhow::Result<()> {
         // Loading a model mutates a real runtime, so it is gated exactly like the
         // daemon's reconciliation tick (`run_staging_tick`): a load may fire only
@@ -406,6 +451,37 @@ impl StagingWorker {
         reason: String,
         pending_context: Option<String>,
     ) {
+        self.queue_intent(
+            decision_id,
+            foreground_model,
+            background_model,
+            target_runtime,
+            reason,
+            pending_context,
+            true,
+        )
+        .await;
+    }
+
+    /// Queues a staging intent, marking it runnable (`Pending`) when `runnable`
+    /// is true and leaving it `Blocked` otherwise. A recommended stage against a
+    /// *live* runtime is recorded but reported as `Blocked` until live execution
+    /// is explicitly enabled (`ANEMOI_ENABLE_LIVE_EXECUTE=1`); only a mock runtime
+    /// (or the gate being open) makes it immediately runnable. The decision and
+    /// the intent are recorded regardless — only the runnability flag changes.
+    // Arguments mirror StagingIntent's fields plus the runnability gate; bundling
+    // them into a struct would only move the sprawl to the call site.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn queue_intent(
+        &self,
+        decision_id: Uuid,
+        foreground_model: Option<ModelId>,
+        background_model: ModelId,
+        target_runtime: RuntimeId,
+        reason: String,
+        pending_context: Option<String>,
+        runnable: bool,
+    ) {
         let mut intent = StagingIntent::new(
             decision_id,
             foreground_model,
@@ -414,7 +490,17 @@ impl StagingWorker {
             reason,
         );
         intent.pending_context = pending_context;
-        intent.mark_pending();
+        if runnable {
+            intent.mark_pending();
+        } else {
+            // Recorded but gated: leave the intent Blocked (its initial state) and
+            // note why, so /staging explains it instead of showing a ready-to-run
+            // intent that execute_pending/run_staging_tick would refuse anyway.
+            intent.last_error = Some(
+                "blocked: target runtime is not mock and ANEMOI_ENABLE_LIVE_EXECUTE is not set"
+                    .to_string(),
+            );
+        }
         self.enqueue(intent).await;
     }
 
@@ -1026,14 +1112,21 @@ impl AppState {
                     .escalation_intent
                     .as_ref()
                     .and_then(|intent| intent.context.clone());
+                // Gate runnability: a background load mutates a live runtime, so
+                // a stage against a non-mock runtime is only runnable when
+                // ANEMOI_ENABLE_LIVE_EXECUTE=1. Otherwise it is recorded but
+                // reported as Blocked rather than queued ready-to-run.
+                let is_mock = self.runtime_adapter_type(&runtime_id.0) == Some("mock");
+                let runnable = is_mock || self.live_execute_enabled();
                 self.staging_worker
-                    .unblock_and_queue(
+                    .queue_intent(
                         decision.id,
                         decision.selected_model.clone(),
                         model_id.clone(),
                         runtime_id.clone(),
                         reason,
                         pending_context,
+                        runnable,
                     )
                     .await;
             }
@@ -1118,45 +1211,6 @@ impl AppState {
         }
 
         plan
-    }
-
-    pub async fn execute_action_plan(&self, plan: &ActionPlan) -> anyhow::Result<Vec<String>> {
-        let mut results = Vec::new();
-
-        if plan.dry_run {
-            return Ok(results);
-        }
-
-        if !live_execution_enabled() {
-            return Err(anyhow::anyhow!(
-                "Live execution requires ANEMOI_ENABLE_LIVE_EXECUTE=1"
-            ));
-        }
-
-        for action in &plan.actions {
-            if action.kind == ActionKind::Load {
-                if let Some(model_id) = &action.model_id {
-                    if let Some(runtime) = self.runtimes.get(&action.runtime_id.to_string()) {
-                        match runtime.load_model(model_id).await {
-                            Ok(handle) => {
-                                results.push(format!(
-                                    "Loaded {} on {} (handle: {})",
-                                    model_id, action.runtime_id, handle.id
-                                ));
-                            }
-                            Err(e) => {
-                                results.push(format!(
-                                    "Failed to load {} on {}: {}",
-                                    model_id, action.runtime_id, e
-                                ));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(results)
     }
 
     /// Build an eviction plan from the reconciled cache and configured policy.
@@ -1385,8 +1439,23 @@ impl AppState {
             let runtime_id = intent.target_runtime.0.clone();
             let is_mock = self.runtime_adapter_type(&runtime_id) == Some("mock");
             if !is_mock && !live_execution_enabled() {
+                // Record why the load was skipped so operators can see, via
+                // /staging, that a growing staging.pending is gated rather than
+                // stuck. The intent stays Pending (reconcile_ready can still
+                // complete it if the model becomes resident by other means).
+                self.staging_worker
+                    .note_tick(
+                        intent.id,
+                        Some(format!(
+                            "live execution disabled: runtime '{runtime_id}' is not mock and ANEMOI_ENABLE_LIVE_EXECUTE is not set"
+                        )),
+                    )
+                    .await;
                 continue;
             }
+            // A load is about to be attempted: count the attempt and clear any
+            // prior skip reason.
+            self.staging_worker.note_tick(intent.id, None).await;
             if let Some(adapter) = self.runtimes.get(&runtime_id) {
                 match adapter.load_model(&intent.background_model).await {
                     Ok(_) => {
@@ -2047,6 +2116,47 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn record_error_preserves_last_good_snapshot_and_marks_stale() {
+        let reconciler = Reconciler::new(60_000);
+        let good = RuntimeSnapshot {
+            runtime_id: RuntimeId("rt".to_string()),
+            available: true,
+            residents: vec![ModelResident {
+                model_id: ModelId("qwen9b".to_string()),
+                state: ResidencyState::HotGpu,
+                vram_mb: Some(9000),
+                ram_mb: None,
+                kv_cache_mb: None,
+                loaded_since: None,
+            }],
+            configured_models: vec![ModelId("qwen9b".to_string())],
+            memory: anemoi_core::RuntimeMemorySnapshot::default(),
+            active_requests: vec![],
+        };
+        reconciler.update("rt", good).await;
+
+        // A transient inspect failure after a good reconcile.
+        reconciler
+            .record_error("rt", "inspect timed out".to_string())
+            .await;
+
+        let reconciled = reconciler.get("rt").await.expect("entry exists");
+        // The last observed residents survive instead of being wiped to empty.
+        assert_eq!(reconciled.snapshot.residents.len(), 1);
+        assert_eq!(
+            reconciled.snapshot.residents[0].model_id,
+            ModelId("qwen9b".to_string())
+        );
+        assert!(
+            reconciled.snapshot.available,
+            "the prior snapshot's availability is preserved"
+        );
+        // ...but it is now flagged stale with the error explaining why.
+        assert!(reconciled.is_stale);
+        assert_eq!(reconciled.last_error.as_deref(), Some("inspect timed out"));
+    }
+
     #[test]
     fn resident_transitions_detects_first_observation_change_and_skips_unchanged() {
         let model = |id: &str, state: ResidencyState| ModelResident {
@@ -2283,6 +2393,129 @@ mod tests {
         assert!(
             !intents.is_empty(),
             "StageBackground decision should enqueue staging intent"
+        );
+    }
+
+    // A non-mock-typed runtime ("llama_swap") that with_mock_residents backs with
+    // a MockRuntimeAdapter (only "ollama" becomes a real adapter), holding a hot
+    // small worker. The large model is cold, so decide() stages it in the
+    // background on this runtime — exercising the queue-time live-execute gate.
+    fn stage_background_state_on_live_runtime(live_execute: bool) -> AppState {
+        let yaml = r#"
+domains:
+  coding:
+    rosters: [small_swarm, large_models]
+residency_groups:
+  small_swarm:
+    purpose: [test]
+    keep_hot: true
+    allow_background_load: true
+    models: [qwen9b]
+  large_models:
+    purpose: [test]
+    keep_hot: false
+    allow_background_load: true
+    models: [qwen35_a3b]
+models:
+  qwen9b:
+    family: qwen
+    parameter_class: 9b
+    context_window: 32768
+    vram_required_mb: 9000
+    ram_required_mb: 12000
+    cold_load_estimate_ms: 18000
+    supported_runtimes: [live_rt]
+  qwen35_a3b:
+    family: qwen
+    parameter_class: 35b
+    context_window: 32768
+    vram_required_mb: 30000
+    ram_required_mb: 45000
+    cold_load_estimate_ms: 45000
+    supported_runtimes: [live_rt]
+runtimes:
+  live_rt:
+    adapter: llama_swap
+    base_url: http://127.0.0.1:9
+continuity:
+  keep_small_worker_hot: true
+  background_load: true
+  max_blank_wait_ms: 1500
+  prefer_degraded_response_over_silence: true
+"#;
+        let config = AnemoiConfig::from_yaml_str(yaml).expect("live-runtime config");
+        let residents = HashMap::from([(
+            "live_rt".to_string(),
+            vec![ModelResident {
+                model_id: ModelId("qwen9b".to_string()),
+                state: ResidencyState::HotGpu,
+                vram_mb: Some(9000),
+                ram_mb: Some(12000),
+                kv_cache_mb: None,
+                loaded_since: None,
+            }],
+        )]);
+        AppState::with_mock_residents(config, residents)
+            .expect("state")
+            .with_live_execute(live_execute)
+    }
+
+    #[tokio::test]
+    async fn stage_against_mock_runtime_is_runnable() {
+        let mut config = example_config();
+        config.continuity.background_load = true;
+        config.continuity.keep_small_worker_hot = true;
+        let state = AppState::new(config, Arc::new(InMemoryDecisionLog::default())).expect("state");
+
+        let decision = state.decide(&sample_request()).await.expect("decision");
+        assert_eq!(decision.action, DecisionAction::StageBackground);
+
+        let intents = state.staging_worker().get_all().await;
+        assert_eq!(intents.len(), 1);
+        assert_eq!(
+            intents[0].state,
+            StagingState::Pending,
+            "a stage against a mock runtime is immediately runnable"
+        );
+    }
+
+    #[tokio::test]
+    async fn stage_against_live_runtime_without_flag_is_blocked() {
+        let state = stage_background_state_on_live_runtime(false);
+
+        let decision = state.decide(&sample_request()).await.expect("decision");
+        assert_eq!(decision.action, DecisionAction::StageBackground);
+
+        let intents = state.staging_worker().get_all().await;
+        assert_eq!(intents.len(), 1);
+        assert_eq!(
+            intents[0].state,
+            StagingState::Blocked,
+            "a stage against a live runtime must be blocked without ANEMOI_ENABLE_LIVE_EXECUTE"
+        );
+        let reason = intents[0]
+            .last_error
+            .as_deref()
+            .expect("a blocked intent should explain the gate");
+        assert!(
+            reason.contains("ANEMOI_ENABLE_LIVE_EXECUTE"),
+            "block reason should name the gate, got: {reason}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stage_against_live_runtime_with_flag_is_runnable() {
+        let state = stage_background_state_on_live_runtime(true);
+
+        let decision = state.decide(&sample_request()).await.expect("decision");
+        assert_eq!(decision.action, DecisionAction::StageBackground);
+
+        let intents = state.staging_worker().get_all().await;
+        assert_eq!(intents.len(), 1);
+        assert_eq!(
+            intents[0].state,
+            StagingState::Pending,
+            "enabling live execution makes the live-runtime stage runnable"
         );
     }
 
@@ -2645,27 +2878,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn live_action_plan_execution_requires_explicit_enable_flag() {
-        let state = AppState::new(example_config(), Arc::new(InMemoryDecisionLog::default()))
-            .expect("state");
-
-        let mut plan = ActionPlan::new(Uuid::new_v4(), false);
-        plan.add_load(
-            RuntimeId("mock".to_string()),
-            ModelId("qwen35_a3b".to_string()),
-            true,
-            "Test load".to_string(),
-            None,
-        );
-
-        let result = state.execute_action_plan(&plan).await;
-        assert!(
-            result.is_err(),
-            "live execution should fail without ANEMOI_ENABLE_LIVE_EXECUTE=1"
-        );
-    }
-
-    #[tokio::test]
     async fn mock_eviction_executes_unload_action_when_plan_is_approved() {
         let state = AppState::new(example_config(), Arc::new(InMemoryDecisionLog::default()))
             .expect("state");
@@ -2989,6 +3201,58 @@ runtimes:
             still_pending.len(),
             1,
             "non-mock staging intent should stay pending without ANEMOI_ENABLE_LIVE_EXECUTE"
+        );
+    }
+
+    #[tokio::test]
+    async fn staging_tick_records_skip_telemetry_when_live_execution_disabled() {
+        // Same setup as the skip test above: a non-mock runtime with the
+        // live-execute gate closed. The intent stays pending, but each tick must
+        // now leave a diagnostic so a growing staging.pending is explainable.
+        let mut config = example_config();
+        let live_runtime_id = RuntimeId("live_rt".to_string());
+        config.runtimes.insert(
+            live_runtime_id.clone(),
+            RuntimeConfig {
+                adapter: "ollama".to_string(),
+                base_url: Some("http://127.0.0.1:11434".to_string()),
+                auth_token: None,
+                initial_residents: vec![],
+                config_path: None,
+            },
+        );
+
+        let state = AppState::new(config, Arc::new(InMemoryDecisionLog::default())).expect("state");
+        state
+            .staging_worker
+            .unblock_and_queue(
+                Uuid::new_v4(),
+                None,
+                ModelId("qwen9b".to_string()),
+                live_runtime_id,
+                "held behind live gate".to_string(),
+                None,
+            )
+            .await;
+
+        state.run_staging_tick().await;
+        state.run_staging_tick().await;
+
+        let intents = state.staging_worker.get_all().await;
+        assert_eq!(intents.len(), 1);
+        let intent = &intents[0];
+        assert_eq!(intent.state, StagingState::Pending);
+        assert_eq!(
+            intent.attempt_count, 2,
+            "each tick should count an attempt against the gated intent"
+        );
+        let reason = intent
+            .last_skip_reason
+            .as_deref()
+            .expect("a skipped intent must record why");
+        assert!(
+            reason.contains("ANEMOI_ENABLE_LIVE_EXECUTE"),
+            "skip reason should explain the live-execute gate, got: {reason}"
         );
     }
 
