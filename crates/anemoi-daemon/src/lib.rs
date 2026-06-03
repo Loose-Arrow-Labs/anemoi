@@ -94,11 +94,25 @@ impl Reconciler {
 
     pub async fn record_error(&self, runtime_id: &str, error: String) {
         let mut cache = self.cache.write().await;
-        let runtime_id_obj = RuntimeId(runtime_id.to_string());
-        cache.insert(
-            runtime_id.to_string(),
-            ReconciledSnapshot::from_error(runtime_id_obj, error),
-        );
+        match cache.get_mut(runtime_id) {
+            // A transient inspect failure must not erase the last observed state.
+            // Keep the prior snapshot (and its `last_inspected`, the last
+            // *successful* inspection), but flag it stale and attach the error so
+            // /residents and decide() see the last good state plus an explicit
+            // staleness/error marker rather than a synthetic empty one.
+            Some(existing) => {
+                existing.is_stale = true;
+                existing.last_error = Some(error);
+            }
+            // No prior snapshot: the initial entry is the unavailable placeholder.
+            None => {
+                let runtime_id_obj = RuntimeId(runtime_id.to_string());
+                cache.insert(
+                    runtime_id.to_string(),
+                    ReconciledSnapshot::from_error(runtime_id_obj, error),
+                );
+            }
+        }
     }
 
     pub async fn mark_stale(&self) {
@@ -1937,6 +1951,47 @@ mod tests {
             !snapshot.snapshot.available,
             "snapshot should be marked unavailable"
         );
+    }
+
+    #[tokio::test]
+    async fn record_error_preserves_last_good_snapshot_and_marks_stale() {
+        let reconciler = Reconciler::new(60_000);
+        let good = RuntimeSnapshot {
+            runtime_id: RuntimeId("rt".to_string()),
+            available: true,
+            residents: vec![ModelResident {
+                model_id: ModelId("qwen9b".to_string()),
+                state: ResidencyState::HotGpu,
+                vram_mb: Some(9000),
+                ram_mb: None,
+                kv_cache_mb: None,
+                loaded_since: None,
+            }],
+            configured_models: vec![ModelId("qwen9b".to_string())],
+            memory: anemoi_core::RuntimeMemorySnapshot::default(),
+            active_requests: vec![],
+        };
+        reconciler.update("rt", good).await;
+
+        // A transient inspect failure after a good reconcile.
+        reconciler
+            .record_error("rt", "inspect timed out".to_string())
+            .await;
+
+        let reconciled = reconciler.get("rt").await.expect("entry exists");
+        // The last observed residents survive instead of being wiped to empty.
+        assert_eq!(reconciled.snapshot.residents.len(), 1);
+        assert_eq!(
+            reconciled.snapshot.residents[0].model_id,
+            ModelId("qwen9b".to_string())
+        );
+        assert!(
+            reconciled.snapshot.available,
+            "the prior snapshot's availability is preserved"
+        );
+        // ...but it is now flagged stale with the error explaining why.
+        assert!(reconciled.is_stale);
+        assert_eq!(reconciled.last_error.as_deref(), Some("inspect timed out"));
     }
 
     #[test]
