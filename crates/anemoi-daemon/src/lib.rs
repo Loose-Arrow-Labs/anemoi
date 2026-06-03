@@ -156,6 +156,27 @@ impl Reconciler {
     pub async fn has_cache(&self) -> bool {
         !self.cache.read().await.is_empty()
     }
+
+    /// True when a decision should re-inspect before relying on the cache: the
+    /// cache is empty, or any entry has aged past the TTL, is flagged stale, or
+    /// carries a recorded inspect error. This is what stops `decide` from
+    /// scheduling indefinitely on evidence that has expired or come from a
+    /// since-failed runtime.
+    pub async fn needs_refresh(&self) -> bool {
+        let cache = self.cache.read().await;
+        if cache.is_empty() {
+            return true;
+        }
+        let now = Utc::now();
+        cache.values().any(|r| {
+            r.is_stale
+                || r.last_error.is_some()
+                || now
+                    .signed_duration_since(r.last_inspected)
+                    .num_milliseconds()
+                    > self.ttl_ms as i64
+        })
+    }
 }
 
 impl Default for Reconciler {
@@ -1071,7 +1092,12 @@ impl AppState {
     }
 
     pub async fn decide(&self, request: &InferenceRequest) -> anyhow::Result<Decision> {
-        if !self.reconciler.has_cache().await {
+        // Refresh before scheduling when the cache is empty or any entry is stale
+        // (TTL exceeded) or carries an inspect error, so decisions never run on
+        // evidence that has aged out or come from a since-failed runtime. When
+        // every entry is fresh this is a no-op, preserving cache reuse across a
+        // burst of decisions.
+        if self.reconciler.needs_refresh().await {
             self.run_reconciliation_tick().await;
         }
         let snapshots = self.reconciler.get_snapshots().await;
@@ -2044,6 +2070,49 @@ mod tests {
         assert!(
             !snapshot.snapshot.available,
             "snapshot should be marked unavailable"
+        );
+    }
+
+    #[tokio::test]
+    async fn needs_refresh_is_false_for_fresh_and_true_after_ttl_expiry() {
+        let reconciler = Reconciler::new(10);
+        reconciler
+            .update(
+                "rt",
+                RuntimeSnapshot {
+                    runtime_id: RuntimeId("rt".to_string()),
+                    available: true,
+                    residents: vec![],
+                    configured_models: vec![],
+                    memory: anemoi_core::RuntimeMemorySnapshot::default(),
+                    active_requests: vec![],
+                },
+            )
+            .await;
+
+        assert!(
+            !reconciler.needs_refresh().await,
+            "a freshly updated entry needs no refresh"
+        );
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        assert!(
+            reconciler.needs_refresh().await,
+            "an entry aged past the TTL must trigger a refresh"
+        );
+    }
+
+    #[tokio::test]
+    async fn needs_refresh_is_true_when_an_entry_has_an_inspect_error() {
+        let reconciler = Reconciler::new(60_000);
+        reconciler
+            .record_error("rt", "connection refused".to_string())
+            .await;
+
+        assert!(
+            reconciler.needs_refresh().await,
+            "a cached snapshot with last_error must not be served as-is; it triggers a refresh"
         );
     }
 
@@ -3249,6 +3318,80 @@ runtimes:
         assert_eq!(
             total, 1,
             "decide burst must reuse the reconciler cache; got {total} inspects"
+        );
+    }
+
+    #[tokio::test]
+    async fn decide_reinspects_when_cache_is_stale() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingAdapter {
+            inner: DynRuntimeAdapter,
+            inspects: Arc<AtomicUsize>,
+        }
+
+        #[async_trait::async_trait]
+        impl anemoi_runtime::RuntimeAdapter for CountingAdapter {
+            fn id(&self) -> RuntimeId {
+                self.inner.id()
+            }
+            async fn inspect(&self) -> Result<RuntimeSnapshot, anemoi_runtime::RuntimeError> {
+                self.inspects.fetch_add(1, Ordering::SeqCst);
+                self.inner.inspect().await
+            }
+            async fn load_model(
+                &self,
+                model: &ModelId,
+            ) -> Result<anemoi_runtime::LoadHandle, anemoi_runtime::RuntimeError> {
+                self.inner.load_model(model).await
+            }
+            async fn unload_model(
+                &self,
+                model: &ModelId,
+            ) -> Result<(), anemoi_runtime::RuntimeError> {
+                self.inner.unload_model(model).await
+            }
+            async fn execute(
+                &self,
+                request: anemoi_core::ExecutionRequest,
+            ) -> Result<anemoi_runtime::ExecutionHandle, anemoi_runtime::RuntimeError> {
+                self.inner.execute(request).await
+            }
+        }
+
+        let mut state = AppState::new(example_config(), Arc::new(InMemoryDecisionLog::default()))
+            .expect("state");
+        let inspects = Arc::new(AtomicUsize::new(0));
+        let original = state
+            .runtimes
+            .get("mock")
+            .expect("mock runtime present")
+            .clone();
+        state.runtimes.insert(
+            "mock".to_string(),
+            Arc::new(CountingAdapter {
+                inner: original,
+                inspects: inspects.clone(),
+            }),
+        );
+
+        // First decision populates the cache (one inspect); a second reuses it.
+        state.decide(&sample_request()).await.expect("decision");
+        state.decide(&sample_request()).await.expect("decision");
+        assert_eq!(
+            inspects.load(Ordering::SeqCst),
+            1,
+            "a fresh cache must be reused without re-inspecting"
+        );
+
+        // Mark the cache stale (as TTL expiry would). The next decision must
+        // re-inspect instead of scheduling on the aged snapshot.
+        state.reconciler().mark_stale().await;
+        state.decide(&sample_request()).await.expect("decision");
+        assert_eq!(
+            inspects.load(Ordering::SeqCst),
+            2,
+            "a stale cache must trigger re-inspection before deciding"
         );
     }
 
