@@ -390,6 +390,17 @@ impl InMemoryDecisionLog {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// Synchronously inserts a decision, de-duplicated by id and preserving
+    /// first-seen order. Used to rehydrate the index from a persisted log on
+    /// construction, where an async `record_decision` cannot be awaited.
+    fn insert_sync(&self, decision: Decision) {
+        let mut state = self.state.write().unwrap();
+        if !state.decisions.contains_key(&decision.id) {
+            state.order.push(decision.id);
+        }
+        state.decisions.insert(decision.id, decision);
+    }
 }
 
 #[derive(Debug, Default)]
@@ -436,10 +447,24 @@ impl JsonlDecisionLog {
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             std::fs::create_dir_all(parent)?;
         }
-        Ok(Self {
-            memory: InMemoryDecisionLog::default(),
-            path,
-        })
+        let memory = InMemoryDecisionLog::default();
+        // Rehydrate the in-memory index from any existing log so decisions are
+        // readable after a process restart (AGENTS.md §11: durability requires a
+        // restart round-trip). Blank lines and lines that fail to parse (e.g. a
+        // torn final record from an interrupted append) are skipped so a partial
+        // write never prevents startup.
+        if path.exists() {
+            for line in std::fs::read_to_string(&path)?.lines() {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                if let Ok(decision) = serde_json::from_str::<Decision>(line) {
+                    memory.insert_sync(decision);
+                }
+            }
+        }
+        Ok(Self { memory, path })
     }
 
     pub fn path(&self) -> &Path {
@@ -557,6 +582,60 @@ mod tests {
             serde_json::from_str::<Decision>(lines[1]).expect("second json"),
             second
         );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn jsonl_decision_log_reloads_decisions_after_restart() {
+        let path = temp_jsonl_path();
+        let decision = sample_decision_with_summary("durable across restart");
+
+        // Process 1: write through one instance, then drop it.
+        {
+            let log = JsonlDecisionLog::new(&path).expect("jsonl log");
+            log.record_decision(&decision).await.expect("record");
+        }
+
+        // Process 2: a fresh instance over the same file must read it back.
+        let reopened = JsonlDecisionLog::new(&path).expect("reopen jsonl log");
+        assert_eq!(
+            reopened.get_decision(decision.id).await.expect("get"),
+            Some(decision.clone())
+        );
+        assert_eq!(
+            reopened.list_decisions().await.expect("list"),
+            vec![decision]
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn jsonl_decision_log_skips_malformed_lines_on_reload() {
+        let path = temp_jsonl_path();
+        let good = sample_decision_with_summary("good record");
+
+        {
+            let log = JsonlDecisionLog::new(&path).expect("jsonl log");
+            log.record_decision(&good).await.expect("record");
+        }
+        // Simulate a torn final append (process crashed mid-write).
+        {
+            let mut file = OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .expect("append handle");
+            file.write_all(b"{\"id\":\"not-a-full-decision\"")
+                .expect("torn write");
+        }
+
+        // Reopen must succeed (not brick) and still return the good decision.
+        let reopened = JsonlDecisionLog::new(&path).expect("reopen tolerates torn line");
+        assert_eq!(
+            reopened.get_decision(good.id).await.expect("get"),
+            Some(good)
+        );
+
         let _ = std::fs::remove_file(path);
     }
 

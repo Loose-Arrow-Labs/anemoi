@@ -10,11 +10,15 @@ use uuid::Uuid;
 
 mod eviction;
 mod pressure;
+mod transition;
 pub use eviction::{
     plan_evictions, BlockedEviction, EvictionCandidate, EvictionCandidateResident, EvictionPlan,
     EvictionRequest, ProtectedResident,
 };
 pub use pressure::{Pressure, PressureAssessment, PressureInputs, PressureModel, PressureReason};
+pub use transition::{
+    ActiveTransition, TransitionCoordinator, TransitionDecision, TransitionPath, TransitionRequest,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum PolicyError {
@@ -48,6 +52,11 @@ impl Scheduler {
             .map(|candidate| score_candidate(request, candidate, &self.config))
             .collect::<Vec<_>>();
 
+        // Highest score wins. This is a stable sort, so candidates whose scores
+        // tie keep their candidate-generation order: roster order, then the
+        // group's `models` order, then `supported_runtimes` order — all driven by
+        // config `Vec`s, so the tie-break is deterministic across runs. See the
+        // `decide_score_tie_*` tests, which pin this contract.
         candidates.sort_by_key(|candidate| Reverse(candidate.score.total));
 
         let Some(best) = candidates.first().cloned() else {
@@ -292,6 +301,15 @@ impl ScoredCandidate {
         request: &InferenceRequest,
         rejected_options: Vec<RejectedOption>,
     ) -> Decision {
+        // A StageBackground decision must always carry the model it is staging.
+        // `decide` only ever pairs the two, so the `_` arm below would otherwise
+        // emit a generic "with action StageBackground" summary that silently
+        // dropped the staged model if a future caller forgot to set it.
+        debug_assert!(
+            !matches!(self.action, DecisionAction::StageBackground)
+                || self.background_model.is_some(),
+            "StageBackground decision must carry a background_model"
+        );
         let summary = match (&self.action, &self.background_model) {
             (DecisionAction::StageBackground, Some(background)) => format!(
                 "Selected {} via {} and staged {} to avoid an interactive cold-load wait.",
@@ -1008,6 +1026,49 @@ continuity:
             .contains("prefers degraded response over silence"));
     }
 
+    // debug_assert is compiled out under --release, so this invariant test only
+    // runs when debug assertions are active (the default for `cargo test`).
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "StageBackground decision must carry a background_model")]
+    fn into_decision_panics_on_stage_background_without_model() {
+        // (StageBackground, None) is unreachable from decide(), which always
+        // pairs a staging action with a background model. The debug_assert pins
+        // that invariant so the generic `_` summary arm can't silently swallow a
+        // staging decision that forgot to record its staged model.
+        let candidate = Candidate {
+            action: DecisionAction::StageBackground,
+            model_id: ModelId("qwen9b".to_string()),
+            runtime_id: RuntimeId("mock".to_string()),
+            group_id: ResidencyGroupId("small_swarm".to_string()),
+            model_profile: ModelProfile {
+                id: ModelId("qwen9b".to_string()),
+                family: "qwen".to_string(),
+                parameter_class: "9b".to_string(),
+                context_window: None,
+                vram_required_mb: None,
+                ram_required_mb: None,
+                cold_load_estimate_ms: None,
+                supported_runtimes: vec![RuntimeId("mock".to_string())],
+                supports_streaming: None,
+            },
+            residency_state: ResidencyState::HotGpu,
+            load_estimate_ms: 0,
+            runtime_memory: RuntimeMemorySnapshot::default(),
+            active_request_count: 0,
+            group_keep_hot: false,
+        };
+        let scored = ScoredCandidate {
+            action: DecisionAction::StageBackground,
+            candidate,
+            background_model: None,
+            score: DecisionScore::default(),
+            reasons: Vec::new(),
+        };
+
+        let _ = scored.into_decision(&candidate_request(), Vec::new());
+    }
+
     #[test]
     fn score_includes_continuity_contribution() {
         let scheduler = Scheduler::new(candidate_config());
@@ -1429,6 +1490,91 @@ runtimes:
 "#,
         )
         .expect("candidate config")
+    }
+
+    // Two models with identical profiles in one keep-hot group; `model_order`
+    // controls the order they are listed (and therefore generated). When both
+    // are hot-resident they score identically, exercising the score-tie path.
+    fn tie_config_ordered(model_order: &str) -> AnemoiConfig {
+        let profile = "{ family: qwen, parameter_class: 9b, context_window: 32768, \
+             vram_required_mb: 9000, ram_required_mb: 12000, cold_load_estimate_ms: 18000, \
+             supported_runtimes: [mock] }";
+        let yaml = format!(
+            "domains:\n  coding:\n    rosters: [swarm]\n\
+             residency_groups:\n  swarm:\n    keep_hot: true\n    allow_background_load: true\n    models: {model_order}\n\
+             models:\n  alpha: {profile}\n  beta: {profile}\n\
+             runtimes:\n  mock:\n    adapter: mock\n"
+        );
+        serde_yaml::from_str(&yaml).expect("tie config")
+    }
+
+    fn both_hot_snapshot() -> RuntimeSnapshot {
+        let hot = |id: &str| ModelResident {
+            model_id: ModelId(id.to_string()),
+            state: ResidencyState::HotGpu,
+            vram_mb: Some(9000),
+            ram_mb: None,
+            kv_cache_mb: None,
+            loaded_since: None,
+        };
+        RuntimeSnapshot {
+            runtime_id: RuntimeId("mock".to_string()),
+            available: true,
+            residents: vec![hot("alpha"), hot("beta")],
+            configured_models: Vec::new(),
+            memory: RuntimeMemorySnapshot::default(),
+            active_requests: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn decide_score_tie_breaks_on_generation_order() {
+        let request = candidate_request();
+        let snapshots = [both_hot_snapshot()];
+
+        let alpha_first = Scheduler::new(tie_config_ordered("[alpha, beta]"))
+            .decide(&request, &snapshots)
+            .expect("decision");
+        let beta_first = Scheduler::new(tie_config_ordered("[beta, alpha]"))
+            .decide(&request, &snapshots)
+            .expect("decision");
+
+        // Identical profiles => identical scores, so the winner's score is the
+        // same regardless of order. This proves we are genuinely on the score-tie
+        // path rather than just picking the higher-scoring model.
+        assert_eq!(alpha_first.score.total, beta_first.score.total);
+        // The model listed first in the group wins the tie.
+        assert_eq!(
+            alpha_first.selected_model,
+            Some(ModelId("alpha".to_string()))
+        );
+        assert_eq!(beta_first.selected_model, Some(ModelId("beta".to_string())));
+    }
+
+    #[test]
+    fn decide_score_tie_winner_is_stable_across_invocations() {
+        let request = candidate_request();
+        let snapshots = [both_hot_snapshot()];
+        let scheduler = Scheduler::new(tie_config_ordered("[alpha, beta]"));
+
+        let winners: std::collections::HashSet<_> = (0..32)
+            .map(|_| {
+                scheduler
+                    .decide(&request, &snapshots)
+                    .expect("decision")
+                    .selected_model
+            })
+            .collect();
+
+        assert_eq!(
+            winners.len(),
+            1,
+            "score-tie winner must be deterministic across invocations, saw {winners:?}"
+        );
+        assert_eq!(
+            winners.into_iter().next().unwrap(),
+            Some(ModelId("alpha".to_string()))
+        );
     }
 
     #[test]
