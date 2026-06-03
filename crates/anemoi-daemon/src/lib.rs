@@ -2877,6 +2877,172 @@ continuity:
         );
     }
 
+    fn execute_state_from_yaml(
+        yaml: &str,
+        residents: HashMap<String, Vec<ModelResident>>,
+        live_execute: bool,
+    ) -> AppState {
+        let config = AnemoiConfig::from_yaml_str(yaml).expect("execute test config");
+        AppState::with_mock_residents(config, residents)
+            .expect("state")
+            .with_live_execute(live_execute)
+    }
+
+    fn qwen9b_hot_on(runtime: &str) -> HashMap<String, Vec<ModelResident>> {
+        HashMap::from([(
+            runtime.to_string(),
+            vec![ModelResident {
+                model_id: ModelId("qwen9b".to_string()),
+                state: ResidencyState::HotGpu,
+                vram_mb: Some(9000),
+                ram_mb: Some(12000),
+                kv_cache_mb: None,
+                loaded_since: None,
+            }],
+        )])
+    }
+
+    #[tokio::test]
+    async fn execute_walks_action_plan_and_loads_background_model() {
+        // Hot small worker + cold large model => decide() stages the large model
+        // in the background. /execute must walk that plan and load the
+        // background_model, not the foreground selected_model.
+        let yaml = r#"
+domains:
+  coding:
+    rosters: [small_swarm, large_models]
+residency_groups:
+  small_swarm:
+    purpose: [test]
+    keep_hot: true
+    allow_background_load: true
+    models: [qwen9b]
+  large_models:
+    purpose: [test]
+    keep_hot: false
+    allow_background_load: true
+    models: [qwen35_a3b]
+models:
+  qwen9b:
+    family: qwen
+    parameter_class: 9b
+    context_window: 32768
+    vram_required_mb: 9000
+    ram_required_mb: 12000
+    cold_load_estimate_ms: 18000
+    supported_runtimes: [mock]
+  qwen35_a3b:
+    family: qwen
+    parameter_class: 35b
+    context_window: 32768
+    vram_required_mb: 30000
+    ram_required_mb: 45000
+    cold_load_estimate_ms: 45000
+    supported_runtimes: [mock]
+runtimes:
+  mock:
+    adapter: mock
+continuity:
+  keep_small_worker_hot: true
+  background_load: true
+  max_blank_wait_ms: 1500
+  prefer_degraded_response_over_silence: true
+"#;
+        // ANEMOI_ENABLE_LIVE_EXECUTE=1 simulated via the per-AppState override.
+        let state = execute_state_from_yaml(yaml, qwen9b_hot_on("mock"), true);
+
+        let response = router(state)
+            .oneshot(json_request("/execute", &sample_request()))
+            .await
+            .expect("response");
+        let execute: ExecuteResponse =
+            serde_json::from_value(json_body(response).await).expect("execute response");
+
+        assert_eq!(execute.decision.action, DecisionAction::StageBackground);
+        let background = execute
+            .decision
+            .background_model
+            .clone()
+            .expect("a background model");
+        assert_ne!(
+            Some(&background),
+            execute.decision.selected_model.as_ref(),
+            "the staged background model must differ from the foreground selected_model"
+        );
+        assert!(
+            execute.handoff.load_requested,
+            "the planned background load must run under live execution"
+        );
+        assert!(
+            execute
+                .action_results
+                .iter()
+                .any(|r| r.contains(&format!("Loaded {background}"))),
+            "the background model must be the one loaded, got: {:?}",
+            execute.action_results
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_reuse_hot_loads_nothing_and_reports_noop() {
+        // Only a hot small worker and no staging => decide() returns ReuseHot,
+        // whose plan is a single no-op. /execute must call no runtime load yet
+        // still report the no-op step.
+        let yaml = r#"
+domains:
+  coding:
+    rosters: [small_swarm]
+residency_groups:
+  small_swarm:
+    purpose: [test]
+    keep_hot: true
+    allow_background_load: false
+    models: [qwen9b]
+models:
+  qwen9b:
+    family: qwen
+    parameter_class: 9b
+    context_window: 32768
+    vram_required_mb: 9000
+    ram_required_mb: 12000
+    cold_load_estimate_ms: 18000
+    supported_runtimes: [mock]
+runtimes:
+  mock:
+    adapter: mock
+continuity:
+  keep_small_worker_hot: true
+  background_load: false
+  max_blank_wait_ms: 1500
+  prefer_degraded_response_over_silence: true
+"#;
+        let state = execute_state_from_yaml(yaml, qwen9b_hot_on("mock"), false);
+
+        let response = router(state)
+            .oneshot(json_request("/execute", &sample_request()))
+            .await
+            .expect("response");
+        let execute: ExecuteResponse =
+            serde_json::from_value(json_body(response).await).expect("execute response");
+
+        assert_eq!(execute.decision.action, DecisionAction::ReuseHot);
+        assert!(
+            !execute.handoff.load_requested,
+            "ReuseHot must not trigger any load"
+        );
+        assert_eq!(
+            execute.action_results.len(),
+            1,
+            "the single no-op step should be reported, got: {:?}",
+            execute.action_results
+        );
+        assert!(
+            execute.action_results[0].contains("No-op"),
+            "the no-op step must be reported, got: {:?}",
+            execute.action_results
+        );
+    }
+
     #[tokio::test]
     async fn mock_eviction_executes_unload_action_when_plan_is_approved() {
         let state = AppState::new(example_config(), Arc::new(InMemoryDecisionLog::default()))
@@ -4334,9 +4500,11 @@ pub fn openapi_document() -> serde_json::Value {
                 },
                 "ExecuteResponse": {
                     "type": "object",
-                    "required": ["decision", "handoff"],
+                    "required": ["decision", "action_plan", "handoff"],
                     "properties": {
                         "decision": { "$ref": "#/components/schemas/Decision" },
+                        "action_plan": { "type": "object" },
+                        "action_results": { "type": "array", "items": { "type": "string" } },
                         "handoff": { "$ref": "#/components/schemas/ExecuteHandoff" }
                     }
                 },
@@ -4401,38 +4569,61 @@ async fn execute(
         None => None,
     };
 
-    let dry_run = !live_execution_enabled();
+    let live = state.live_execute_enabled();
+    let dry_run = !live;
     let action_plan = state.generate_action_plan(&decision, dry_run);
 
+    // Walk the generated action plan and execute each step, rather than
+    // re-deriving a single load from decision.selected_model (which is the
+    // foreground model, not the StageBackground target). The plan is the source
+    // of truth for what should run. A Load step fires when its runtime is mock or
+    // live execution is enabled — non-mock loads require the flag, matching the
+    // staging tick's gate. Non-Load steps mutate nothing but are reported.
     let mut load_requested = false;
     let mut action_results = Vec::new();
-
-    if !dry_run {
-        if let (Some(runtime_id), Some(model_id)) =
-            (&decision.selected_runtime, &decision.selected_model)
-        {
-            let adapter_type = state.runtime_adapter_type(&runtime_id.to_string());
-            let is_mock = adapter_type == Some("mock");
-            if is_mock {
-                if let Some(runtime) = state.runtimes.get(&runtime_id.to_string()) {
-                    match runtime.load_model(model_id).await {
+    for action in &action_plan.actions {
+        match action.kind {
+            ActionKind::Load => {
+                let runtime_id = action.runtime_id.to_string();
+                let Some(model_id) = action.model_id.clone() else {
+                    action_results.push(format!(
+                        "Skipped load on {runtime_id}: action has no model id"
+                    ));
+                    continue;
+                };
+                let is_mock = state.runtime_adapter_type(&runtime_id) == Some("mock");
+                if !is_mock && !live {
+                    action_results.push(format!(
+                        "Skipped load of {model_id} on {runtime_id}: live execution disabled (set ANEMOI_ENABLE_LIVE_EXECUTE=1)"
+                    ));
+                    continue;
+                }
+                match state.runtimes.get(&runtime_id) {
+                    Some(runtime) => match runtime.load_model(&model_id).await {
                         Ok(handle) => {
                             load_requested = true;
-                            action_results
-                                .push(format!("Loaded {} (handle: {})", model_id, handle.id));
+                            action_results.push(format!(
+                                "Loaded {model_id} on {runtime_id} (handle: {})",
+                                handle.id
+                            ));
                         }
-                        Err(e) => {
-                            action_results.push(format!("Load failed: {}", e));
-                        }
-                    }
+                        Err(e) => action_results
+                            .push(format!("Failed to load {model_id} on {runtime_id}: {e}")),
+                    },
+                    None => action_results.push(format!(
+                        "Skipped load of {model_id}: runtime {runtime_id} not configured"
+                    )),
                 }
             }
+            // No other action kind mutates a runtime in v1; report it verbatim.
+            _ => action_results.push(format!("No-op ({:?}): {}", action.kind, action.reason)),
         }
     }
 
     Ok(Json(ExecuteResponse {
         decision,
         action_plan,
+        action_results,
         handoff: ExecuteHandoff {
             load_requested,
             full_inference_forwarded: false,
@@ -4451,6 +4642,11 @@ async fn execute(
 pub struct ExecuteResponse {
     pub decision: Decision,
     pub action_plan: ActionPlan,
+    /// Per-step outcome of walking `action_plan` (loaded / failed / skipped /
+    /// no-op), so an operator can see exactly what `/execute` did. Defaulted for
+    /// backward compatibility with older serialized responses.
+    #[serde(default)]
+    pub action_results: Vec<String>,
     pub handoff: ExecuteHandoff,
 }
 
