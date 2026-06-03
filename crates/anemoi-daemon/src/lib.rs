@@ -1094,45 +1094,6 @@ impl AppState {
         plan
     }
 
-    pub async fn execute_action_plan(&self, plan: &ActionPlan) -> anyhow::Result<Vec<String>> {
-        let mut results = Vec::new();
-
-        if plan.dry_run {
-            return Ok(results);
-        }
-
-        if !live_execution_enabled() {
-            return Err(anyhow::anyhow!(
-                "Live execution requires ANEMOI_ENABLE_LIVE_EXECUTE=1"
-            ));
-        }
-
-        for action in &plan.actions {
-            if action.kind == ActionKind::Load {
-                if let Some(model_id) = &action.model_id {
-                    if let Some(runtime) = self.runtimes.get(&action.runtime_id.to_string()) {
-                        match runtime.load_model(model_id).await {
-                            Ok(handle) => {
-                                results.push(format!(
-                                    "Loaded {} on {} (handle: {})",
-                                    model_id, action.runtime_id, handle.id
-                                ));
-                            }
-                            Err(e) => {
-                                results.push(format!(
-                                    "Failed to load {} on {}: {}",
-                                    model_id, action.runtime_id, e
-                                ));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(results)
-    }
-
     /// Build an eviction plan from the reconciled cache and configured policy.
     /// Pure read of governance state — never mutates a runtime.
     pub async fn plan_evictions(&self, force: bool) -> EvictionPlan {
@@ -2572,27 +2533,6 @@ mod tests {
         assert!(
             plan.actions.iter().all(|a| !a.is_mutating || plan.dry_run),
             "dry run plan should not execute mutating actions"
-        );
-    }
-
-    #[tokio::test]
-    async fn live_action_plan_execution_requires_explicit_enable_flag() {
-        let state = AppState::new(example_config(), Arc::new(InMemoryDecisionLog::default()))
-            .expect("state");
-
-        let mut plan = ActionPlan::new(Uuid::new_v4(), false);
-        plan.add_load(
-            RuntimeId("mock".to_string()),
-            ModelId("qwen35_a3b".to_string()),
-            true,
-            "Test load".to_string(),
-            None,
-        );
-
-        let result = state.execute_action_plan(&plan).await;
-        assert!(
-            result.is_err(),
-            "live execution should fail without ANEMOI_ENABLE_LIVE_EXECUTE=1"
         );
     }
 
