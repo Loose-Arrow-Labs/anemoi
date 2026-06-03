@@ -243,6 +243,17 @@ pub struct StagingIntent {
     pub created_at: DateTime<Utc>,
     pub state: StagingState,
     pub last_error: Option<String>,
+    /// Number of staging-tick attempts for this intent, whether the load fired
+    /// or was skipped by the live-execute gate. Lets an operator see that a
+    /// pending intent is being re-evaluated each tick rather than stuck.
+    #[serde(default)]
+    pub attempt_count: u32,
+    /// Why the most recent staging tick did not run the load (e.g. the
+    /// live-execute gate is closed for a non-mock runtime). Cleared to `None`
+    /// once a load is actually attempted. Surfaced via the `/staging` endpoint so
+    /// a growing `staging.pending` always carries an explanation.
+    #[serde(default)]
+    pub last_skip_reason: Option<String>,
     /// Context payload declared via `escalation_intent` at decision time, held
     /// until the foreground model is evicted. On the eviction signal it is
     /// written to the [`EscalationContextCache`], `context_ref` is set, and this
@@ -275,6 +286,8 @@ impl StagingIntent {
             created_at: Utc::now(),
             state: StagingState::Blocked,
             last_error: None,
+            attempt_count: 0,
+            last_skip_reason: None,
             pending_context: None,
             context_ref: None,
         }
@@ -282,6 +295,14 @@ impl StagingIntent {
 
     pub fn mark_pending(&mut self) {
         self.state = StagingState::Pending;
+    }
+
+    /// Records that a staging tick processed this intent without changing its
+    /// state: bumps `attempt_count` and sets `last_skip_reason` (`Some` when the
+    /// tick skipped the load, `None` when a load was actually attempted).
+    pub fn note_tick(&mut self, skip_reason: Option<String>) {
+        self.attempt_count += 1;
+        self.last_skip_reason = skip_reason;
     }
 
     pub fn mark_completed(&mut self) {
@@ -340,6 +361,16 @@ impl StagingWorker {
                     intent.state = StagingState::Blocked;
                 }
             }
+        }
+    }
+
+    /// Records a staging-tick attempt against an intent without changing its
+    /// state (see [`StagingIntent::note_tick`]). `skip_reason` is `Some` when the
+    /// tick skipped the load and `None` when a load was attempted.
+    pub async fn note_tick(&self, intent_id: Uuid, skip_reason: Option<String>) {
+        let mut queue = self.queue.write().await;
+        if let Some(intent) = queue.iter_mut().find(|i| i.id == intent_id) {
+            intent.note_tick(skip_reason);
         }
     }
 
@@ -1334,8 +1365,23 @@ impl AppState {
             let runtime_id = intent.target_runtime.0.clone();
             let is_mock = self.runtime_adapter_type(&runtime_id) == Some("mock");
             if !is_mock && !live_execution_enabled() {
+                // Record why the load was skipped so operators can see, via
+                // /staging, that a growing staging.pending is gated rather than
+                // stuck. The intent stays Pending (reconcile_ready can still
+                // complete it if the model becomes resident by other means).
+                self.staging_worker
+                    .note_tick(
+                        intent.id,
+                        Some(format!(
+                            "live execution disabled: runtime '{runtime_id}' is not mock and ANEMOI_ENABLE_LIVE_EXECUTE is not set"
+                        )),
+                    )
+                    .await;
                 continue;
             }
+            // A load is about to be attempted: count the attempt and clear any
+            // prior skip reason.
+            self.staging_worker.note_tick(intent.id, None).await;
             if let Some(adapter) = self.runtimes.get(&runtime_id) {
                 match adapter.load_model(&intent.background_model).await {
                     Ok(_) => {
@@ -2915,6 +2961,58 @@ runtimes:
             still_pending.len(),
             1,
             "non-mock staging intent should stay pending without ANEMOI_ENABLE_LIVE_EXECUTE"
+        );
+    }
+
+    #[tokio::test]
+    async fn staging_tick_records_skip_telemetry_when_live_execution_disabled() {
+        // Same setup as the skip test above: a non-mock runtime with the
+        // live-execute gate closed. The intent stays pending, but each tick must
+        // now leave a diagnostic so a growing staging.pending is explainable.
+        let mut config = example_config();
+        let live_runtime_id = RuntimeId("live_rt".to_string());
+        config.runtimes.insert(
+            live_runtime_id.clone(),
+            RuntimeConfig {
+                adapter: "ollama".to_string(),
+                base_url: Some("http://127.0.0.1:11434".to_string()),
+                auth_token: None,
+                initial_residents: vec![],
+                config_path: None,
+            },
+        );
+
+        let state = AppState::new(config, Arc::new(InMemoryDecisionLog::default())).expect("state");
+        state
+            .staging_worker
+            .unblock_and_queue(
+                Uuid::new_v4(),
+                None,
+                ModelId("qwen9b".to_string()),
+                live_runtime_id,
+                "held behind live gate".to_string(),
+                None,
+            )
+            .await;
+
+        state.run_staging_tick().await;
+        state.run_staging_tick().await;
+
+        let intents = state.staging_worker.get_all().await;
+        assert_eq!(intents.len(), 1);
+        let intent = &intents[0];
+        assert_eq!(intent.state, StagingState::Pending);
+        assert_eq!(
+            intent.attempt_count, 2,
+            "each tick should count an attempt against the gated intent"
+        );
+        let reason = intent
+            .last_skip_reason
+            .as_deref()
+            .expect("a skipped intent must record why");
+        assert!(
+            reason.contains("ANEMOI_ENABLE_LIVE_EXECUTE"),
+            "skip reason should explain the live-execute gate, got: {reason}"
         );
     }
 
