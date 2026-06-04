@@ -1,21 +1,31 @@
-FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
-WORKDIR /src
+# syntax=docker/dockerfile:1
+#
+# Multi-stage build for the Anemoi governance daemon (anemoi-daemon).
+# Builds from source so the image is reproducible from a checkout; the runtime
+# image carries only the release binary plus its dynamic deps.
+#
+# Notes:
+#   - reqwest uses its default native-tls backend -> the binary links openssl 3
+#     (libssl.so.3 / libcrypto.so.3). Builder needs pkg-config + libssl-dev;
+#     runtime needs libssl3.
+#   - rusqlite is compiled with the "bundled" feature -> sqlite is statically
+#     linked, so no libsqlite3 is required at runtime (the rust image already
+#     ships a C toolchain to compile it).
+#   - Builder and runtime are both Debian bookworm so glibc matches by
+#     construction (binary requires GLIBC_2.34).
 
-COPY ["Anemoi.sln", "./"]
-COPY ["src/Anemoi.Api/Anemoi.Api.csproj", "src/Anemoi.Api/"]
-COPY ["src/Anemoi.Core/Anemoi.Core.csproj", "src/Anemoi.Core/"]
-COPY ["src/Anemoi.Backends.Ollama/Anemoi.Backends.Ollama.csproj", "src/Anemoi.Backends.Ollama/"]
-COPY ["src/Anemoi.Backends.LlamaCpp/Anemoi.Backends.LlamaCpp.csproj", "src/Anemoi.Backends.LlamaCpp/"]
-RUN dotnet restore "Anemoi.sln"
-
+FROM rust:1-bookworm AS builder
+WORKDIR /build
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends pkg-config libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
 COPY . .
-RUN dotnet publish "src/Anemoi.Api/Anemoi.Api.csproj" -c Release -o /app/publish /p:UseAppHost=false
+RUN cargo build --release -p anemoi-daemon
 
-FROM mcr.microsoft.com/dotnet/aspnet:10.0 AS runtime
-WORKDIR /app
-COPY --from=build /app/publish .
-
-ENV ASPNETCORE_URLS=http://+:8080
-EXPOSE 8080
-
-ENTRYPOINT ["dotnet", "Anemoi.Api.dll"]
+FROM debian:bookworm-slim AS runtime
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates libssl3 curl \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /build/target/release/anemoi-daemon /usr/local/bin/anemoi-daemon
+EXPOSE 7070
+ENTRYPOINT ["/usr/local/bin/anemoi-daemon"]
