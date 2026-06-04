@@ -1,0 +1,5 @@
+# Keep the Docker build context small. These are not needed to compile the
+# daemon and would otherwise be uploaded to the daemon (target/ is multi-GB).
+target/
+.git/
+**/*.bak
