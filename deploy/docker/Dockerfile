@@ -27,6 +27,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates libssl3 curl \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
+RUN mkdir -p config
 COPY --from=builder /build/target/release/anemoi-daemon /usr/local/bin/anemoi-daemon
 COPY --from=builder /build/config/anemoi.example.yaml /app/config/anemoi.yaml
 ENV ANEMOI_BIND=0.0.0.0:7070
