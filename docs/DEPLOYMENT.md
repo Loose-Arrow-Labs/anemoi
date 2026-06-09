@@ -199,6 +199,8 @@ docker build -t anemoi:latest .
 docker run -d \
   --name anemoi \
   -p 7070:7070 \
+  -e ANEMOI_BIND=0.0.0.0:7070 \
+  -e ANEMOI_CONFIG=/app/config/anemoi.yaml \
   -v /etc/anemoi:/etc/anemoi \
   -v /var/lib/anemoi:/var/lib/anemoi \
   anemoi:latest
@@ -212,6 +214,12 @@ curl http://anemoi.home.arpa/health
 
 # Status
 curl http://anemoi.home.arpa/status
+
+# Telemetry summary
+curl http://anemoi.home.arpa/telemetry/summary
+
+# Dashboard
+open http://anemoi.home.arpa/dashboard/
 
 # Models list (inference gateway)
 curl http://anemoi.home.arpa/v1/models
