@@ -1,9 +1,23 @@
 services:
-  anemoi-router:
+  anemoi:
     build:
       context: ../..
       dockerfile: deploy/docker/Dockerfile
+    image: anemoi:local
     ports:
-      - "8080:8080"
+      - "7070:7070"
+    environment:
+      ANEMOI_BIND: "0.0.0.0:7070"
+      ANEMOI_CONFIG: "/app/config/anemoi.yaml"
+      ANEMOI_DATABASE_URL: "sqlite:///var/lib/anemoi/events.db"
     volumes:
-      - ../config/appsettings.example.json:/app/appsettings.json:ro
+      - ../../config/anemoi.example.yaml:/app/config/anemoi.yaml:ro
+      - anemoi-data:/var/lib/anemoi
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:7070/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  anemoi-data:
