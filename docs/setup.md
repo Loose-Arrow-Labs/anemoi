@@ -93,16 +93,9 @@ If `clippy` is not installed:
 rustup component add clippy
 ```
 
-## Legacy .NET Surface
-
-This checkout still contains `src/Anemoi.*` and `Anemoi.sln`. Treat those files
-as `Needs validation`. Do not delete, rename, or migrate them unless a task
-explicitly scopes legacy migration.
-
 ## Deferred
 
 - Full inference forwarding
 - Provider gateway behavior
 - Cloud execution
 - Database-backed analytics
-- Legacy .NET migration
