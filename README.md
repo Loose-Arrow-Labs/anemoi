@@ -1,6 +1,10 @@
 # Anemoi
 
-**Status**: ✅ Production-ready (All issues #30-34 delivered and merged)
+[![CI](https://github.com/Loose-Arrow-Labs/anemoi/actions/workflows/ci.yml/badge.svg)](https://github.com/Loose-Arrow-Labs/anemoi/actions/workflows/ci.yml)
+[![Release](https://github.com/Loose-Arrow-Labs/anemoi/actions/workflows/release.yml/badge.svg)](https://github.com/Loose-Arrow-Labs/anemoi/actions/workflows/release.yml)
+
+**Status**: Beta. CI is active; tagged release artifacts are prepared through
+the release workflow.
 
 Anemoi is a local-first inference governance layer for heterogeneous AI systems. It decides which model to use for each request based on resource constraints, latency budgets, and explicit policy scoring.
 
@@ -32,6 +36,18 @@ cargo run -p anemoi-cli -- status
 cargo run -p anemoi-cli -- decide --domain coding
 cargo run -p anemoi-cli -- explain <decision-id>
 ```
+
+## Beta Release Artifacts
+
+CI runs the Rust validation gates on every PR. Tagged beta releases are built by
+the release workflow and attach platform archives containing `anemoi` and
+`anemoi-daemon`. Until the first tag is cut, build from source with:
+
+```powershell
+cargo build --release -p anemoi-cli -p anemoi-daemon
+```
+
+See [docs/RELEASE.md](docs/RELEASE.md) for the release and install path.
 
 ---
 

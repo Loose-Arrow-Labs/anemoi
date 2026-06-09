@@ -34,7 +34,12 @@ Start here to understand what Anemoi does and how to use it.
    - Troubleshooting production issues
    - Performance tuning
 
-5. **[test_roadmap.md](test_roadmap.md)** (reference)
+5. **[RELEASE.md](RELEASE.md)** (10 min read)
+   - CI badges
+   - Tagged release workflow
+   - Source-build fallback
+
+6. **[test_roadmap.md](test_roadmap.md)** (reference)
    - Complete feature list
    - Test gates and requirements
    - All 28 prompts status (✅ 28/28 complete)
