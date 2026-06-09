@@ -483,5 +483,6 @@ $RECYCLE.BIN/
 *.swp
 
 # Local daemon run captures (stdout/stderr redirects, not for commit)
-/daemon_output.txt
-/daemon_error.txt
+/daemon_*.txt
+/*_output.txt
+/*_error.txt
