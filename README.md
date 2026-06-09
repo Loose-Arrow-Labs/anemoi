@@ -1,6 +1,7 @@
 # Anemoi
 
-**Status**: ✅ Production-ready (All issues #30-34 delivered and merged)
+**Status**: Beta. The mock path is operational; live runtime, Docker/DNS, and
+dashboard readiness are tracked in [Known Limitations](docs/LIMITATIONS.md).
 
 Anemoi is a local-first inference governance layer for heterogeneous AI systems. It decides which model to use for each request based on resource constraints, latency budgets, and explicit policy scoring.
 
@@ -49,6 +50,12 @@ Anemoi owns the decision logic:
 - Decision telemetry and structured explanations.
 
 Anemoi is **not** an inference runtime, model host, provider gateway, or agent framework.
+
+## Known Limitations
+
+Before using Anemoi as a public beta or LAN/DNS service, read
+[docs/LIMITATIONS.md](docs/LIMITATIONS.md). It centralizes live-runtime,
+Docker/DNS, dashboard, MCP, legacy-surface, and security caveats.
 
 ## System Position
 
@@ -162,7 +169,7 @@ Permanent audit trail with SQLite:
 - Request forwarding with runtime authentication
 - Response streaming with telemetry headers
 - Mock mode for testing without network calls
-- Production-ready with live execution guard (`ANEMOI_ENABLE_LIVE_EXECUTE=1`)
+- Live execution is beta and gated by `ANEMOI_ENABLE_LIVE_EXECUTE=1`
 
 ---
 
@@ -382,7 +389,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 - **Gateway**: OpenAI-compatible inference endpoint active ✅
 - **Telemetry**: SQLite event store recording all decisions ✅
 - **Documentation**: Guides and examples complete ✅
-- **Legacy Surface**: `.NET`/C# files in `src/Anemoi.*` marked as `Needs validation`
+- **Known limitations**: see `docs/LIMITATIONS.md`
 - **Local-First**: By default, services bind to loopback (configurable via `anemoi.home.arpa`)
 
 ---

@@ -10,6 +10,9 @@ Runtimes execute.
 The v1 mock-config demo needs Rust and does not require Ollama, llama.cpp,
 llama-swap, SQLite, or a cloud provider.
 
+For beta caveats and surfaces that still need live validation, see
+[Known Limitations](LIMITATIONS.md).
+
 ## Local Prerequisites
 
 - Rust toolchain with `cargo`
@@ -96,13 +99,14 @@ rustup component add clippy
 ## Legacy .NET Surface
 
 This checkout still contains `src/Anemoi.*` and `Anemoi.sln`. Treat those files
-as `Needs validation`. Do not delete, rename, or migrate them unless a task
-explicitly scopes legacy migration.
+as `Needs validation`; see [Known Limitations](LIMITATIONS.md). Do not delete,
+rename, or migrate them unless a task explicitly scopes legacy migration.
 
 ## Deferred
 
-- Full inference forwarding
 - Provider gateway behavior
 - Cloud execution
-- Database-backed analytics
 - Legacy .NET migration
+
+See [Known Limitations](LIMITATIONS.md) for implemented beta surfaces and
+pending public-readiness work.

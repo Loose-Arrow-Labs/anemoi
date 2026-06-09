@@ -25,28 +25,32 @@ Start here to understand what Anemoi does and how to use it.
    - Response telemetry
    - Troubleshooting
 
+4. **[LIMITATIONS.md](LIMITATIONS.md)** (5 min read)
+   - Stable, beta, base implementation, and needs-validation surfaces
+   - Live runtime, Docker/DNS, dashboard, MCP, and security caveats
+
 ### For Operators & Developers
 
-4. **[DEPLOYMENT.md](DEPLOYMENT.md)** (20 min read)
+5. **[DEPLOYMENT.md](DEPLOYMENT.md)** (20 min read)
    - Production deployment steps
    - Configuration guide
    - Monitoring and alerting
    - Troubleshooting production issues
    - Performance tuning
 
-5. **[test_roadmap.md](test_roadmap.md)** (reference)
+6. **[test_roadmap.md](test_roadmap.md)** (reference)
    - Complete feature list
    - Test gates and requirements
    - All 28 prompts status (✅ 28/28 complete)
 
 ### Integration Guides
 
-6. **[Pi Integration Guide](../../.pi/ANEMOI_INTEGRATION.md)**
+7. **[Pi Integration Guide](../../.pi/ANEMOI_INTEGRATION.md)**
    - How to use Anemoi in Pi
    - Configuration details
    - Troubleshooting Pi issues
 
-7. **[OpenCode Integration Guide](../../source/repos/pantheon/.opencode/ANEMOI_INTEGRATION.md)**
+8. **[OpenCode Integration Guide](../../source/repos/pantheon/.opencode/ANEMOI_INTEGRATION.md)**
    - How to use Anemoi in OpenCode
    - Configuration details
    - Model selection
@@ -114,7 +118,9 @@ You're extending or integrating Anemoi. See:
 | #33 | Durable Event Store | SQLite audit trail of all decisions |
 | #34 | Inference Gateway | OpenAI-compatible `/v1/chat/completions` |
 
-All features fully integrated with Pi and OpenCode.
+The mock path and core gateway surfaces are implemented. Review
+[Known Limitations](LIMITATIONS.md) before relying on live runtime, Docker/DNS,
+dashboard, or public beta workflows.
 
 ---
 

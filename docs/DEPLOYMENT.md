@@ -2,6 +2,9 @@
 
 This guide covers deploying Anemoi to production environments.
 
+Deployment is a beta surface. Review [Known Limitations](LIMITATIONS.md)
+before exposing Anemoi beyond loopback.
+
 ## Pre-Deployment Checklist
 
 - [ ] All tests passing: `cargo test --workspace`
