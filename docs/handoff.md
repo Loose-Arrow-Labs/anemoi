@@ -49,7 +49,6 @@ opening `http://127.0.0.1:7071/health` and `http://localhost:7071/health`.
 
 ## Needs Validation
 
-- Legacy `.NET`/C# surface under `src/Anemoi.*` and `Anemoi.sln`.
 - llama-swap residency semantics: `/v1/models` is treated as configured model
   metadata, not proof of resident/running models.
 - Full inference forwarding is intentionally not implemented in v1.

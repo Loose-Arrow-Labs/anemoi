@@ -63,6 +63,7 @@ impl ReconciledSnapshot {
             configured_models: Vec::new(),
             memory: anemoi_core::RuntimeMemorySnapshot::default(),
             active_requests: Vec::new(),
+            colocation: None,
         };
         Self {
             snapshot,
@@ -2042,6 +2043,7 @@ mod tests {
             configured_models: Vec::new(),
             memory: anemoi_core::RuntimeMemorySnapshot::default(),
             active_requests: vec![],
+            colocation: None,
         };
         reconciler.update("test", snapshot).await;
 
@@ -2086,6 +2088,7 @@ mod tests {
                     configured_models: vec![],
                     memory: anemoi_core::RuntimeMemorySnapshot::default(),
                     active_requests: vec![],
+                    colocation: None,
                 },
             )
             .await;
@@ -2133,6 +2136,7 @@ mod tests {
             configured_models: vec![ModelId("qwen9b".to_string())],
             memory: anemoi_core::RuntimeMemorySnapshot::default(),
             active_requests: vec![],
+            colocation: None,
         };
         reconciler.update("rt", good).await;
 
@@ -3706,6 +3710,35 @@ continuity:
         );
     }
 
+    #[tokio::test]
+    async fn gateway_quality_floor_reaches_policy_and_changes_selected_model() {
+        let body = serde_json::json!({
+            "model": "coding",
+            "messages": [{ "role": "user", "content": "complex task" }],
+            "max_tokens": 128,
+            "anemoi": {
+                "quality_floor": { "minimum_parameter_class": "32b" },
+                "latency_budget_ms": 60000
+            }
+        });
+
+        let response = router(large_context_gateway_state())
+            .oneshot(json_request("/v1/chat/completions", &body))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-anemoi-selected-model")
+                .expect("selected model")
+                .to_str()
+                .expect("ascii"),
+            "wide32b"
+        );
+    }
+
     #[test]
     fn inference_gateway_strips_anemoi_metadata_before_forwarding() {
         let body = serde_json::json!({
@@ -3811,6 +3844,7 @@ continuity:
             configured_models: vec![ModelId("llama8b".to_string())],
             memory: anemoi_core::RuntimeMemorySnapshot::default(),
             active_requests: vec![],
+            colocation: None,
         }
     }
 
