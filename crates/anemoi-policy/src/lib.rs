@@ -60,12 +60,22 @@ impl Scheduler {
         // `decide_score_tie_*` tests, which pin this contract.
         candidates.sort_by_key(|candidate| Reverse(candidate.score.total));
 
-        let Some(mut best) = candidates.first().cloned() else {
-            return Ok(deny_decision(request, generated.rejected_options));
+        let floor = quality_floor_value(request);
+        let eligible = candidates
+            .iter()
+            .filter(|candidate| candidate_satisfies_floor(candidate, floor.as_ref()))
+            .collect::<Vec<_>>();
+
+        let Some(mut best) = eligible.first().map(|candidate| (*candidate).clone()) else {
+            let rejected_options = combine_rejected(
+                generated.rejected_options,
+                quality_floor_rejections(&candidates, floor.as_ref(), None),
+            );
+            return Ok(deny_decision(request, rejected_options));
         };
 
         let continuity = &self.config.continuity;
-        let cold_large = candidates
+        let cold_large = eligible
             .iter()
             .filter(|candidate| {
                 candidate.candidate.action == DecisionAction::ColdLoad
@@ -123,6 +133,27 @@ impl Scheduler {
                     value: 50,
                 });
                 staged.score.total += 50;
+                if let Some((floor_label, floor_value)) = floor.as_ref() {
+                    let fallback_class = quality_score(&staged.candidate.model_profile);
+                    if fallback_class < *floor_value {
+                        staged.reasons.push(DecisionReason {
+                            code: "quality_floor.degraded_fallback".to_string(),
+                            detail: format!(
+                                "request required at least {floor_label}; selected hot {} ({}) only as an immediate fallback while staging qualifying {} ({})",
+                                staged.candidate.model_id,
+                                staged.candidate.model_profile.parameter_class,
+                                cold.candidate.model_id,
+                                cold.candidate.model_profile.parameter_class,
+                            ),
+                            impact: -25,
+                        });
+                        staged.score.contributions.push(ScoreContribution {
+                            label: "quality floor degraded fallback".to_string(),
+                            value: -25,
+                        });
+                        staged.score.total -= 25;
+                    }
+                }
                 staged
             } else {
                 // When staging was warranted but the colocation matrix forbids
@@ -148,7 +179,16 @@ impl Scheduler {
             best
         };
 
-        Ok(selected.into_decision(request, generated.rejected_options))
+        let rejected_options = combine_rejected(
+            generated.rejected_options,
+            quality_floor_rejections(
+                &candidates,
+                floor.as_ref(),
+                Some(&selected.candidate.model_id),
+            ),
+        );
+
+        Ok(selected.into_decision(request, rejected_options))
     }
 
     pub fn generate_candidates(
@@ -613,14 +653,64 @@ fn push(
 }
 
 fn quality_score(model: &ModelProfile) -> i32 {
-    let digits = model
-        .parameter_class
+    parameter_class_value(&model.parameter_class)
+}
+
+fn parameter_class_value(parameter_class: &str) -> i32 {
+    let digits = parameter_class
         .chars()
         .filter(|ch| ch.is_ascii_digit())
         .collect::<String>()
         .parse::<i32>()
         .unwrap_or(1);
     digits.clamp(1, 100)
+}
+
+fn quality_floor_value(request: &InferenceRequest) -> Option<(String, i32)> {
+    request
+        .quality_floor
+        .as_ref()?
+        .minimum_parameter_class
+        .as_ref()
+        .map(|floor| (floor.clone(), parameter_class_value(floor)))
+}
+
+fn candidate_satisfies_floor(candidate: &ScoredCandidate, floor: Option<&(String, i32)>) -> bool {
+    floor.is_none_or(|(_, minimum)| quality_score(&candidate.candidate.model_profile) >= *minimum)
+}
+
+fn quality_floor_rejections(
+    candidates: &[ScoredCandidate],
+    floor: Option<&(String, i32)>,
+    selected_model: Option<&ModelId>,
+) -> Vec<RejectedOption> {
+    let Some((floor_label, minimum)) = floor else {
+        return Vec::new();
+    };
+
+    candidates
+        .iter()
+        .filter(|candidate| {
+            selected_model != Some(&candidate.candidate.model_id)
+                && quality_score(&candidate.candidate.model_profile) < *minimum
+        })
+        .map(|candidate| RejectedOption {
+            model_id: Some(candidate.candidate.model_id.clone()),
+            runtime_id: Some(candidate.candidate.runtime_id.clone()),
+            reason: format!(
+                "{} parameter class {} is below requested quality floor {floor_label}",
+                candidate.candidate.model_id, candidate.candidate.model_profile.parameter_class
+            ),
+        })
+        .collect()
+}
+
+fn combine_rejected(
+    mut first: Vec<RejectedOption>,
+    mut second: Vec<RejectedOption>,
+) -> Vec<RejectedOption> {
+    first.append(&mut second);
+    first
 }
 
 fn request_required_tokens(request: &InferenceRequest) -> Option<u32> {
@@ -1189,6 +1279,159 @@ continuity:
             .contains("prefers degraded response over silence"));
     }
 
+    #[test]
+    fn quality_floor_rejects_candidates_below_minimum_parameter_class() {
+        let scheduler = Scheduler::new(fast_only_config());
+
+        let decision = scheduler
+            .decide(
+                &request_with_quality_floor("32b"),
+                &[candidate_snapshot(true)],
+            )
+            .expect("decision");
+
+        assert_eq!(decision.action, DecisionAction::Deny);
+        assert_eq!(decision.selected_model, None);
+        assert!(
+            decision
+                .explanation
+                .rejected_options
+                .iter()
+                .any(|rejected| {
+                    rejected.model_id == Some(ModelId("qwen9b".to_string()))
+                        && rejected.reason.contains("9b")
+                        && rejected.reason.contains("32b")
+                }),
+            "a denied quality-floor request must explain the undersized candidate"
+        );
+    }
+
+    #[test]
+    fn quality_floor_allows_candidate_at_or_above_minimum_parameter_class() {
+        let scheduler = Scheduler::new(candidate_config());
+        let mut request = request_with_quality_floor("32b");
+        request.latency_budget_ms = Some(60_000);
+
+        let decision = scheduler
+            .decide(&request, &[candidate_snapshot(true)])
+            .expect("decision");
+
+        assert_eq!(decision.action, DecisionAction::ColdLoad);
+        assert_eq!(
+            decision.selected_model,
+            Some(ModelId("qwen35_a3b".to_string()))
+        );
+        assert_eq!(decision.background_model, None);
+        assert!(
+            decision
+                .explanation
+                .rejected_options
+                .iter()
+                .any(|rejected| {
+                    rejected.model_id == Some(ModelId("qwen9b".to_string()))
+                        && rejected.reason.contains("quality floor 32b")
+                }),
+            "the smaller hot worker should be rejected by the explicit quality floor"
+        );
+    }
+
+    #[test]
+    fn quality_floor_explanation_names_requested_and_candidate_parameter_class() {
+        let scheduler = Scheduler::new(candidate_config());
+
+        let decision = scheduler
+            .decide(
+                &request_with_quality_floor("32b"),
+                &[candidate_snapshot(true)],
+            )
+            .expect("decision");
+        let reason = decision
+            .explanation
+            .reasons
+            .iter()
+            .find(|reason| reason.code == "quality_floor.degraded_fallback")
+            .expect("quality-floor degraded fallback reason");
+
+        assert!(reason.detail.contains("32b"));
+        assert!(reason.detail.contains("qwen9b"));
+        assert!(reason.detail.contains("9b"));
+        assert!(reason.detail.contains("qwen35_a3b"));
+        assert!(reason.detail.contains("35b"));
+    }
+
+    #[test]
+    fn escalation_selects_large_hot_model_when_available() {
+        let scheduler = Scheduler::new(candidate_config());
+        let snapshot = candidate_snapshot_with_residents(
+            true,
+            vec![
+                ("qwen9b", ResidencyState::HotGpu, Some(9000)),
+                ("qwen35_a3b", ResidencyState::HotGpu, Some(30000)),
+            ],
+        );
+
+        let decision = scheduler
+            .decide(&request_with_quality_floor("32b"), &[snapshot])
+            .expect("decision");
+
+        assert_eq!(decision.action, DecisionAction::ReuseHot);
+        assert_eq!(
+            decision.selected_model,
+            Some(ModelId("qwen35_a3b".to_string()))
+        );
+        assert_eq!(decision.background_model, None);
+    }
+
+    #[test]
+    fn escalation_uses_hot_worker_and_stages_large_model_when_latency_is_tight() {
+        let scheduler = Scheduler::new(candidate_config());
+
+        let decision = scheduler
+            .decide(
+                &request_with_quality_floor("32b"),
+                &[candidate_snapshot(true)],
+            )
+            .expect("decision");
+
+        assert_eq!(decision.action, DecisionAction::StageBackground);
+        assert_eq!(decision.selected_model, Some(ModelId("qwen9b".to_string())));
+        assert_eq!(
+            decision.background_model,
+            Some(ModelId("qwen35_a3b".to_string()))
+        );
+        assert!(decision.explanation.reasons.iter().any(|reason| {
+            reason.code == "quality_floor.degraded_fallback"
+                && reason.detail.contains("selected hot qwen9b")
+                && reason.detail.contains("staging qualifying qwen35_a3b")
+        }));
+    }
+
+    #[test]
+    fn escalation_does_not_silently_satisfy_32b_request_with_9b() {
+        let scheduler = Scheduler::new(fast_only_config());
+
+        let decision = scheduler
+            .decide(
+                &request_with_quality_floor("32b"),
+                &[candidate_snapshot(true)],
+            )
+            .expect("decision");
+
+        assert_eq!(decision.action, DecisionAction::Deny);
+        assert_ne!(decision.selected_model, Some(ModelId("qwen9b".to_string())));
+        assert!(
+            decision
+                .explanation
+                .rejected_options
+                .iter()
+                .any(|rejected| {
+                    rejected.model_id == Some(ModelId("qwen9b".to_string()))
+                        && rejected.reason.contains("quality floor 32b")
+                }),
+            "a 32b request cannot be quietly satisfied by the 9b-only roster"
+        );
+    }
+
     // debug_assert is compiled out under --release, so this invariant test only
     // runs when debug assertions are active (the default for `cargo test`).
     #[cfg(debug_assertions)]
@@ -1591,17 +1834,30 @@ continuity:
     }
 
     fn candidate_snapshot(available: bool) -> RuntimeSnapshot {
+        candidate_snapshot_with_residents(
+            available,
+            vec![("qwen9b", ResidencyState::HotGpu, Some(9000))],
+        )
+    }
+
+    fn candidate_snapshot_with_residents(
+        available: bool,
+        residents: Vec<(&str, ResidencyState, Option<u64>)>,
+    ) -> RuntimeSnapshot {
         RuntimeSnapshot {
             runtime_id: RuntimeId("mock".to_string()),
             available,
-            residents: vec![ModelResident {
-                model_id: ModelId("qwen9b".to_string()),
-                state: ResidencyState::HotGpu,
-                vram_mb: Some(9000),
-                ram_mb: None,
-                kv_cache_mb: None,
-                loaded_since: None,
-            }],
+            residents: residents
+                .into_iter()
+                .map(|(model_id, state, vram_mb)| ModelResident {
+                    model_id: ModelId(model_id.to_string()),
+                    state,
+                    vram_mb,
+                    ram_mb: None,
+                    kv_cache_mb: None,
+                    loaded_since: None,
+                })
+                .collect(),
             configured_models: Vec::new(),
             memory: RuntimeMemorySnapshot::default(),
             active_requests: Vec::new(),
@@ -1655,6 +1911,42 @@ runtimes:
 "#,
         )
         .expect("candidate config")
+    }
+
+    fn fast_only_config() -> AnemoiConfig {
+        serde_yaml::from_str(
+            r#"
+domains:
+  coding:
+    rosters: [small_swarm]
+residency_groups:
+  small_swarm:
+    keep_hot: true
+    allow_background_load: true
+    models: [qwen9b]
+models:
+  qwen9b:
+    family: qwen
+    parameter_class: 9b
+    context_window: 32768
+    vram_required_mb: 9000
+    ram_required_mb: 12000
+    cold_load_estimate_ms: 18000
+    supported_runtimes: [mock]
+runtimes:
+  mock:
+    adapter: mock
+"#,
+        )
+        .expect("fast-only config")
+    }
+
+    fn request_with_quality_floor(floor: &str) -> InferenceRequest {
+        let mut request = candidate_request();
+        request.quality_floor = Some(anemoi_core::QualityFloor {
+            minimum_parameter_class: Some(floor.to_string()),
+        });
+        request
     }
 
     // Two models with identical profiles in one keep-hot group; `model_order`
