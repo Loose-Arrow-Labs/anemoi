@@ -731,11 +731,12 @@ impl LlamaSwapMatrixConfig {
     /// expression; the model ids within each loadout are sorted and
     /// deduplicated (they come from a `BTreeSet`).
     pub fn colocation_constraints(&self) -> ColocationConstraints {
+        let vars = self.string_vars();
         ColocationConstraints {
             loadouts: self
                 .sets
                 .iter()
-                .flat_map(|set| set.loadouts())
+                .flat_map(|set| set.loadouts_with_vars(&vars))
                 .map(|loadout| loadout.into_iter().map(ModelId).collect())
                 .collect(),
         }
