@@ -185,6 +185,40 @@ pub struct RuntimeSnapshot {
     pub configured_models: Vec<ModelId>,
     pub memory: RuntimeMemorySnapshot,
     pub active_requests: Vec<ActiveExecution>,
+    /// Co-residency feasibility observed from the runtime's colocation matrix.
+    /// `None` means the runtime exposes no matrix, so colocation is *unknown*
+    /// and the policy must not infer a constraint; `Some` is authoritative —
+    /// a model pair absent from every loadout cannot be GPU-resident together.
+    /// Currently populated only by the llama-swap adapter when a `config_path`
+    /// with a `matrix` block is supplied.
+    #[serde(default)]
+    pub colocation: Option<ColocationConstraints>,
+}
+
+/// Co-residency feasibility derived from a runtime's colocation matrix
+/// (currently llama-swap's `matrix` block, read off-API from the config file
+/// since llama-swap does not expose it over HTTP). Surfaced on
+/// [`RuntimeSnapshot`] so scheduling policy can answer "may A and B be
+/// GPU-resident together?" through the observed snapshot, without depending on
+/// any runtime adapter.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ColocationConstraints {
+    /// Declared co-resident loadouts. Each inner vec is a set of model ids that
+    /// may be GPU-resident together — sorted and deduplicated at construction —
+    /// derived from one branch of a matrix colocation set's DSL expression.
+    pub loadouts: Vec<Vec<ModelId>>,
+}
+
+impl ColocationConstraints {
+    /// Whether `a` and `b` may be GPU-resident at the same time: `true` when
+    /// some declared loadout contains both. Note an empty constraint set admits
+    /// no pair — a runtime that declares a matrix with no colocation set treats
+    /// every pair as mutually exclusive.
+    pub fn can_colocate(&self, a: &ModelId, b: &ModelId) -> bool {
+        self.loadouts
+            .iter()
+            .any(|loadout| loadout.contains(a) && loadout.contains(b))
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

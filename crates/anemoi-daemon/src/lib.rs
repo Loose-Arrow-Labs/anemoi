@@ -63,6 +63,7 @@ impl ReconciledSnapshot {
             configured_models: Vec::new(),
             memory: anemoi_core::RuntimeMemorySnapshot::default(),
             active_requests: Vec::new(),
+            colocation: None,
         };
         Self {
             snapshot,
@@ -2042,6 +2043,7 @@ mod tests {
             configured_models: Vec::new(),
             memory: anemoi_core::RuntimeMemorySnapshot::default(),
             active_requests: vec![],
+            colocation: None,
         };
         reconciler.update("test", snapshot).await;
 
@@ -2086,6 +2088,7 @@ mod tests {
                     configured_models: vec![],
                     memory: anemoi_core::RuntimeMemorySnapshot::default(),
                     active_requests: vec![],
+                    colocation: None,
                 },
             )
             .await;
@@ -2133,6 +2136,7 @@ mod tests {
             configured_models: vec![ModelId("qwen9b".to_string())],
             memory: anemoi_core::RuntimeMemorySnapshot::default(),
             active_requests: vec![],
+            colocation: None,
         };
         reconciler.update("rt", good).await;
 
@@ -3840,6 +3844,7 @@ continuity:
             configured_models: vec![ModelId("llama8b".to_string())],
             memory: anemoi_core::RuntimeMemorySnapshot::default(),
             active_requests: vec![],
+            colocation: None,
         }
     }
 

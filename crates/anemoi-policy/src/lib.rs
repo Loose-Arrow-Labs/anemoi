@@ -1,7 +1,8 @@
 use anemoi_core::{
-    AnemoiConfig, Decision, DecisionAction, DecisionReason, DecisionScore, DomainId, Explanation,
-    InferenceRequest, ModelId, ModelProfile, RejectedOption, ResidencyGroup, ResidencyGroupId,
-    ResidencyState, RuntimeId, RuntimeMemorySnapshot, RuntimeSnapshot, ScoreContribution,
+    AnemoiConfig, ColocationConstraints, Decision, DecisionAction, DecisionReason, DecisionScore,
+    DomainId, Explanation, InferenceRequest, ModelId, ModelProfile, RejectedOption, ResidencyGroup,
+    ResidencyGroupId, ResidencyState, RuntimeId, RuntimeMemorySnapshot, RuntimeSnapshot,
+    ScoreContribution,
 };
 use chrono::Utc;
 use std::cmp::Reverse;
@@ -65,7 +66,7 @@ impl Scheduler {
             .filter(|candidate| candidate_satisfies_floor(candidate, floor.as_ref()))
             .collect::<Vec<_>>();
 
-        let Some(best) = eligible.first().map(|candidate| (*candidate).clone()) else {
+        let Some(mut best) = eligible.first().map(|candidate| (*candidate).clone()) else {
             let rejected_options = combine_rejected(
                 generated.rejected_options,
                 quality_floor_rejections(&candidates, floor.as_ref(), None),
@@ -94,11 +95,26 @@ impl Scheduler {
         });
 
         let selected = if let (Some(cold), Some(fallback)) = (cold_large, hot_fallback) {
-            if continuity.background_load
+            let wants_stage = continuity.background_load
                 && continuity.prefer_degraded_response_over_silence
-                && request.latency_budget_ms.unwrap_or(u64::MAX) < cold.candidate.load_estimate_ms
-            {
-                let mut staged = (*fallback).clone();
+                && request.latency_budget_ms.unwrap_or(u64::MAX) < cold.candidate.load_estimate_ms;
+
+            // Background staging keeps `fallback` hot while loading `cold` — a
+            // co-resident loadout. It is only safe when the target runtime's
+            // colocation matrix admits the pair: loading `cold` would otherwise
+            // evict `fallback`, defeating the continuity it is meant to preserve.
+            // A matrix-less runtime (`None`) leaves colocation unknown and keeps
+            // the legacy staging behavior; a `cold` model on a different runtime
+            // shares no GPU with `fallback`, so there is no colocation conflict.
+            let colocation_admits = cold.candidate.runtime_id != fallback.candidate.runtime_id
+                || match &fallback.candidate.colocation {
+                    None => true,
+                    Some(constraints) => constraints
+                        .can_colocate(&fallback.candidate.model_id, &cold.candidate.model_id),
+                };
+
+            if wants_stage && colocation_admits {
+                let mut staged = fallback.clone();
                 staged.action = DecisionAction::StageBackground;
                 staged.background_model = Some(cold.candidate.model_id.clone());
                 staged.reasons.push(DecisionReason {
@@ -140,6 +156,23 @@ impl Scheduler {
                 }
                 staged
             } else {
+                // When staging was warranted but the colocation matrix forbids
+                // the co-resident pair, record why we held back so the decision
+                // stays explainable rather than silently serving `best`.
+                if wants_stage {
+                    let detail = format!(
+                        "did not stage {} alongside {} for background load because the {} colocation matrix does not admit them as co-resident; serving {} alone preserves the hot worker",
+                        cold.candidate.model_id,
+                        fallback.candidate.model_id,
+                        fallback.candidate.runtime_id,
+                        best.candidate.model_id
+                    );
+                    best.reasons.push(DecisionReason {
+                        code: "continuity.stage_blocked_colocation".to_string(),
+                        detail,
+                        impact: 0,
+                    });
+                }
                 best
             }
         } else {
@@ -324,6 +357,12 @@ pub struct Candidate {
     pub runtime_memory: RuntimeMemorySnapshot,
     pub active_request_count: usize,
     pub group_keep_hot: bool,
+    /// Colocation feasibility of the runtime this candidate targets, copied from
+    /// the observed snapshot. `None` when the runtime exposes no matrix, so the
+    /// policy applies no co-residency constraint. Consulted when planning
+    /// co-resident loadouts (e.g. background staging) to avoid proposing a
+    /// loadout the matrix forbids.
+    pub colocation: Option<ColocationConstraints>,
 }
 
 #[derive(Debug, Clone)]
@@ -476,6 +515,7 @@ fn generate_candidate(
         runtime_memory: snapshot.memory.clone(),
         active_request_count: snapshot.active_requests.len(),
         group_keep_hot: group.keep_hot,
+        colocation: snapshot.colocation.clone(),
     }
 }
 
@@ -943,6 +983,7 @@ continuity:
             configured_models: Vec::new(),
             memory: RuntimeMemorySnapshot::default(),
             active_requests: Vec::new(),
+            colocation: None,
         };
 
         let decision = scheduler.decide(&request, &[snapshot]).expect("decision");
@@ -958,6 +999,125 @@ continuity:
             .reasons
             .iter()
             .any(|reason| reason.code == "continuity.stage_background"));
+    }
+
+    #[test]
+    fn colocation_matrix_gates_background_staging() {
+        // Same keep-small-hot / cold-big setup as
+        // `avoids_cold_large_model_when_small_worker_is_hot`, but the runtime
+        // snapshot now carries a colocation matrix. Background staging keeps
+        // qwen9b hot while loading qwen35_a3b — a co-resident loadout — so it is
+        // only safe when the matrix admits the pair. The decision must change
+        // purely on what the matrix allows.
+        let config: AnemoiConfig = serde_yaml::from_str(
+            r#"
+domains:
+  coding:
+    rosters: [small_swarm, large_models]
+residency_groups:
+  small_swarm:
+    keep_hot: true
+    allow_background_load: true
+    models: [qwen9b]
+  large_models:
+    keep_hot: false
+    allow_background_load: true
+    models: [qwen35_a3b]
+models:
+  qwen9b:
+    family: qwen
+    parameter_class: 9b
+    context_window: 32768
+    vram_required_mb: 9000
+    ram_required_mb: 12000
+    cold_load_estimate_ms: 18000
+    supported_runtimes: [ollama]
+  qwen35_a3b:
+    family: qwen
+    parameter_class: 35b
+    context_window: 32768
+    vram_required_mb: 30000
+    ram_required_mb: 45000
+    cold_load_estimate_ms: 45000
+    supported_runtimes: [ollama]
+runtimes:
+  ollama:
+    adapter: mock
+continuity:
+  keep_small_worker_hot: true
+  background_load: true
+  max_blank_wait_ms: 1500
+  prefer_degraded_response_over_silence: true
+"#,
+        )
+        .expect("valid config");
+
+        let request = InferenceRequest {
+            id: RequestId::new(),
+            domain: DomainId("coding".to_string()),
+            mode: ExecutionMode::Interactive,
+            prompt_tokens_estimate: Some(2000),
+            max_output_tokens: Some(800),
+            latency_budget_ms: Some(1500),
+            quality_floor: None,
+            escalation_intent: None,
+        };
+
+        let m = |id: &str| ModelId(id.to_string());
+        let snapshot_with = |colocation: Option<ColocationConstraints>| RuntimeSnapshot {
+            runtime_id: RuntimeId("ollama".to_string()),
+            available: true,
+            residents: vec![ModelResident {
+                model_id: ModelId("qwen9b".to_string()),
+                state: ResidencyState::HotGpu,
+                vram_mb: Some(9000),
+                ram_mb: None,
+                kv_cache_mb: None,
+                loaded_since: None,
+            }],
+            configured_models: Vec::new(),
+            memory: RuntimeMemorySnapshot::default(),
+            active_requests: Vec::new(),
+            colocation,
+        };
+
+        let scheduler = Scheduler::new(config);
+
+        // Matrix admits {qwen9b, qwen35_a3b}: stage the big model in the
+        // background while serving the hot small worker — the continuity move.
+        let allowed = scheduler
+            .decide(
+                &request,
+                &[snapshot_with(Some(ColocationConstraints {
+                    loadouts: vec![vec![m("qwen9b"), m("qwen35_a3b")]],
+                }))],
+            )
+            .expect("decision");
+        assert_eq!(allowed.action, DecisionAction::StageBackground);
+        assert_eq!(allowed.background_model, Some(m("qwen35_a3b")));
+
+        // Matrix forbids the pair (each model colocates only with itself):
+        // loading the big model would evict the hot worker, so the decision
+        // changes — serve the hot worker alone, stage nothing, and explain why.
+        let forbidden = scheduler
+            .decide(
+                &request,
+                &[snapshot_with(Some(ColocationConstraints {
+                    loadouts: vec![vec![m("qwen9b")], vec![m("qwen35_a3b")]],
+                }))],
+            )
+            .expect("decision");
+        assert_ne!(forbidden.action, DecisionAction::StageBackground);
+        assert_eq!(forbidden.background_model, None);
+        assert_eq!(forbidden.selected_model, Some(m("qwen9b")));
+        assert!(
+            forbidden
+                .explanation
+                .reasons
+                .iter()
+                .any(|reason| reason.code == "continuity.stage_blocked_colocation"),
+            "a matrix-forbidden co-resident stage must be explained"
+        );
     }
 
     #[test]
@@ -998,6 +1158,7 @@ continuity:
             configured_models: Vec::new(),
             memory: RuntimeMemorySnapshot::default(),
             active_requests: Vec::new(),
+            colocation: None,
         };
         let scheduler = Scheduler::new(candidate_config());
 
@@ -1027,6 +1188,7 @@ continuity:
             configured_models: Vec::new(),
             memory: RuntimeMemorySnapshot::default(),
             active_requests: Vec::new(),
+            colocation: None,
         };
         let scheduler = Scheduler::new(candidate_config());
 
@@ -1068,6 +1230,7 @@ continuity:
             configured_models: Vec::new(),
             memory: RuntimeMemorySnapshot::default(),
             active_requests: Vec::new(),
+            colocation: None,
         };
 
         let decision = scheduler
@@ -1300,6 +1463,7 @@ continuity:
             runtime_memory: RuntimeMemorySnapshot::default(),
             active_request_count: 0,
             group_keep_hot: false,
+            colocation: None,
         };
         let scored = ScoredCandidate {
             action: DecisionAction::StageBackground,
@@ -1697,6 +1861,7 @@ continuity:
             configured_models: Vec::new(),
             memory: RuntimeMemorySnapshot::default(),
             active_requests: Vec::new(),
+            colocation: None,
         }
     }
 
@@ -1816,6 +1981,7 @@ runtimes:
             configured_models: Vec::new(),
             memory: RuntimeMemorySnapshot::default(),
             active_requests: Vec::new(),
+            colocation: None,
         }
     }
 
@@ -1999,6 +2165,7 @@ continuity:
             ],
             memory: RuntimeMemorySnapshot::default(),
             active_requests: Vec::new(),
+            colocation: None,
         };
 
         let request = InferenceRequest {
@@ -2054,6 +2221,7 @@ runtimes:
             configured_models: vec![ModelId("qwen3.6-35b-a3b-mtp".to_string())],
             memory: RuntimeMemorySnapshot::default(),
             active_requests: Vec::new(),
+            colocation: None,
         };
 
         let request = InferenceRequest {
@@ -2098,6 +2266,7 @@ runtimes:
             configured_models: vec![ModelId("qwen3.5-9b-mtp".to_string())],
             memory: RuntimeMemorySnapshot::default(),
             active_requests: Vec::new(),
+            colocation: None,
         };
 
         let request = InferenceRequest {
