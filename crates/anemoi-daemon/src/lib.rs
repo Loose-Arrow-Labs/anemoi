@@ -1,9 +1,11 @@
 use anemoi_core::{
     ActionKind, ActionPlan, AnemoiConfig, Decision, DecisionAction, DomainId, EscalationIntent,
-    ExecutionMode, InferenceRequest, ModelId, ModelResident, QualityFloor, RequestId,
-    ResidencyState, RuntimeId, RuntimeSnapshot,
+    ExecutionMode, GovernanceOverrides, GovernanceWarning, InferenceRequest, MetadataSource,
+    ModelId, ModelProfileOverride, ModelResident, QualityFloor, RequestId, ResidencyGroupConfig,
+    ResidencyGroupId, ResidencyState, RosterOverride, RuntimeId, RuntimeSnapshot,
 };
-use anemoi_policy::{EvictionCandidateResident, EvictionPlan, EvictionRequest, Scheduler};
+use anemoi_policy::{EvictionCandidateResident, EvictionPlan, EvictionRequest};
+mod governance;
 use anemoi_runtime::{
     DynRuntimeAdapter, ForwardedChatCompletion, LlamaCppAdapter, LlamaSwapAdapter,
     LlamaSwapEventStream, MockRuntimeAdapter, OllamaAdapter,
@@ -16,9 +18,10 @@ use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, patch, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
+use governance::{Governance, GovernanceError};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -756,8 +759,13 @@ impl StagingSummary {
 
 #[derive(Clone)]
 pub struct AppState {
+    /// Baseline config from YAML. Operator governance edits layer on top of this
+    /// in `governance`; reads that must reflect edits use `governance.effective()`.
     config: AnemoiConfig,
-    scheduler: Scheduler,
+    /// Operator governance state: baseline + overrides + the derived effective
+    /// config and scheduler. `Arc` so cloning `AppState` (axum does this per
+    /// request) shares one holder, and edits are visible to every clone.
+    governance: Arc<Governance>,
     runtimes: HashMap<String, DynRuntimeAdapter>,
     decision_log: DynDecisionLog,
     reconciler: Reconciler,
@@ -787,7 +795,10 @@ pub struct AppState {
 impl AppState {
     pub fn new(config: AnemoiConfig, decision_log: DynDecisionLog) -> anyhow::Result<Self> {
         config.validate()?;
-        let scheduler = Scheduler::new(config.clone());
+        // Governance overrides persist to an Anemoi-owned file (never the
+        // runtime's own config). Absent the env var, edits are in-memory only.
+        let overrides_path = std::env::var_os("ANEMOI_GOVERNANCE_OVERRIDES").map(PathBuf::from);
+        let governance = Arc::new(Governance::load(config.clone(), overrides_path)?);
         let mut runtimes = HashMap::new();
         let mut event_streams = Vec::new();
 
@@ -862,7 +873,7 @@ impl AppState {
 
         Ok(Self {
             config,
-            scheduler,
+            governance,
             runtimes,
             decision_log,
             reconciler,
@@ -906,7 +917,11 @@ impl AppState {
         residents: HashMap<String, Vec<ModelResident>>,
     ) -> anyhow::Result<Self> {
         config.validate()?;
-        let scheduler = Scheduler::new(config.clone());
+        let governance = Arc::new(Governance::new(
+            config.clone(),
+            anemoi_core::GovernanceOverrides::default(),
+            None,
+        ));
         let mut runtimes = HashMap::new();
         for (runtime_id, runtime) in &config.runtimes {
             let adapter: DynRuntimeAdapter = if runtime.adapter == "ollama" {
@@ -934,7 +949,7 @@ impl AppState {
 
         Ok(Self {
             config,
-            scheduler,
+            governance,
             runtimes,
             decision_log: Arc::new(InMemoryDecisionLog::default()),
             reconciler,
@@ -1109,7 +1124,13 @@ impl AppState {
             self.run_reconciliation_tick().await;
         }
         let snapshots = self.reconciler.get_snapshots().await;
-        let decision = self.scheduler.decide(request, &snapshots)?;
+        // Decide against the *effective* scheduler so operator roster edits take
+        // effect on the very next decision through the real scheduler path.
+        let decision = self
+            .governance
+            .effective()
+            .scheduler
+            .decide(request, &snapshots)?;
 
         if decision.action == DecisionAction::StageBackground {
             if let (Some(runtime_id), Some(model_id)) =
@@ -1157,6 +1178,10 @@ impl AppState {
 
     pub fn generate_action_plan(&self, decision: &Decision, dry_run: bool) -> ActionPlan {
         let mut plan = ActionPlan::new(decision.id, dry_run);
+        // Load estimates come from the effective config so operator profile
+        // overrides on the selected/background model are honored in the plan.
+        let effective = self.governance.effective();
+        let models = &effective.config.models;
 
         match decision.action {
             DecisionAction::ReuseHot => {
@@ -1180,7 +1205,7 @@ impl AppState {
                         decision
                             .selected_model
                             .as_ref()
-                            .and_then(|_| self.config.models.get(model_id))
+                            .and_then(|_| models.get(model_id))
                             .and_then(|p| p.cold_load_estimate_ms),
                     );
                 }
@@ -1197,7 +1222,7 @@ impl AppState {
                         decision
                             .selected_model
                             .as_ref()
-                            .and_then(|_| self.config.models.get(model_id))
+                            .and_then(|_| models.get(model_id))
                             .and_then(|p| p.cold_load_estimate_ms),
                     );
                 }
@@ -1210,10 +1235,7 @@ impl AppState {
                             model_id.clone(),
                             false,
                             "Background staging load".to_string(),
-                            self.config
-                                .models
-                                .get(model_id)
-                                .and_then(|p| p.cold_load_estimate_ms),
+                            models.get(model_id).and_then(|p| p.cold_load_estimate_ms),
                         );
                     }
                 }
@@ -4585,6 +4607,374 @@ continuity:
             "the context is handed off at most once"
         );
     }
+
+    // ── governance / roster management (issue #138) ──────────────────────────
+
+    fn gov_config() -> AnemoiConfig {
+        AnemoiConfig::from_yaml_str(
+            r#"
+domains:
+  coding:
+    rosters: [fast]
+residency_groups:
+  fast:
+    models: [qwen9b]
+    allow_background_load: true
+  big:
+    models: [qwen35b]
+models:
+  qwen9b: {family: qwen, parameter_class: 9b, context_window: 32768, supported_runtimes: [rt]}
+  qwen35b: {family: qwen, parameter_class: 35b, context_window: 32768, supported_runtimes: [rt]}
+runtimes:
+  rt: {adapter: mock}
+continuity:
+  keep_small_worker_hot: false
+  background_load: false
+  max_blank_wait_ms: 5000
+  prefer_degraded_response_over_silence: false
+"#,
+        )
+        .expect("gov config")
+    }
+
+    fn gov_get(uri: &str) -> Request<Body> {
+        Request::builder()
+            .uri(uri)
+            .body(Body::empty())
+            .expect("request")
+    }
+
+    fn gov_del(uri: &str) -> Request<Body> {
+        Request::builder()
+            .method(Method::DELETE)
+            .uri(uri)
+            .body(Body::empty())
+            .expect("request")
+    }
+
+    fn gov_req(method: Method, uri: &str, body: Value) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).expect("json")))
+            .expect("request")
+    }
+
+    async fn gov_send(app: &Router, request: Request<Body>) -> (StatusCode, Value) {
+        let response = app.clone().oneshot(request).await.expect("response");
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("bytes");
+        let value = if bytes.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+        };
+        (status, value)
+    }
+
+    #[tokio::test]
+    async fn catalog_lists_llama_swap_configured_models_without_claiming_residency() {
+        let state = AppState::with_mock_residents(gov_config(), HashMap::new()).expect("state");
+        // A runtime reporting two configured models, only one of which is loaded.
+        state
+            .reconciler
+            .update(
+                "rt",
+                RuntimeSnapshot {
+                    runtime_id: RuntimeId("rt".into()),
+                    available: true,
+                    residents: vec![ModelResident {
+                        model_id: ModelId("qwen9b".into()),
+                        state: ResidencyState::HotGpu,
+                        vram_mb: None,
+                        ram_mb: None,
+                        kv_cache_mb: None,
+                        loaded_since: None,
+                    }],
+                    configured_models: vec![ModelId("qwen9b".into()), ModelId("qwen35b".into())],
+                    memory: Default::default(),
+                    active_requests: vec![],
+                    colocation: None,
+                },
+            )
+            .await;
+        let app = router(state);
+
+        let (status, body) = gov_send(&app, gov_get("/catalog/models")).await;
+        assert_eq!(status, StatusCode::OK);
+        let models = body["models"].as_array().expect("models array");
+        assert_eq!(models.len(), 2);
+        let by_id = |id: &str| {
+            models
+                .iter()
+                .find(|m| m["model_id"] == id)
+                .unwrap_or_else(|| panic!("model {id} present"))
+        };
+        assert_eq!(by_id("qwen9b")["configured"], true);
+        assert_eq!(by_id("qwen9b")["resident_state"], "hot_gpu");
+        // Configured but NOT resident: residency is never inferred from the catalog.
+        assert_eq!(by_id("qwen35b")["configured"], true);
+        assert_eq!(by_id("qwen35b")["resident_state"], Value::Null);
+        assert!(body["note"]
+            .as_str()
+            .unwrap()
+            .to_lowercase()
+            .contains("not residency"));
+    }
+
+    #[tokio::test]
+    async fn operator_can_create_roster_from_catalog_model() {
+        let app =
+            router(AppState::with_mock_residents(gov_config(), HashMap::new()).expect("state"));
+        let (status, body) = gov_send(
+            &app,
+            gov_req(
+                Method::POST,
+                "/rosters",
+                serde_json::json!({"id":"escalation","models":["qwen35b"],"allow_background_load":true}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(body["id"], "escalation");
+        assert_eq!(body["models"][0], "qwen35b");
+
+        let (_, list) = gov_send(&app, gov_get("/rosters")).await;
+        assert!(list["rosters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["id"] == "escalation"));
+    }
+
+    #[tokio::test]
+    async fn operator_can_add_and_remove_model_from_roster_without_runtime_mutation() {
+        let app =
+            router(AppState::with_mock_residents(gov_config(), HashMap::new()).expect("state"));
+
+        let (status, body) = gov_send(
+            &app,
+            gov_req(
+                Method::POST,
+                "/rosters/fast/models",
+                serde_json::json!({"model_id":"qwen35b"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m == "qwen35b"));
+
+        // No runtime mutation: the runtime reports no resident models, because the
+        // roster edit never loaded anything.
+        let (_, residents) = gov_send(&app, gov_get("/residents")).await;
+        let total: usize = residents
+            .as_array()
+            .map(|runtimes| {
+                runtimes
+                    .iter()
+                    .map(|r| r["residents"].as_array().map(|a| a.len()).unwrap_or(0))
+                    .sum()
+            })
+            .unwrap_or(0);
+        assert_eq!(total, 0, "roster edit must not load any model");
+
+        let (status, body) = gov_send(&app, gov_del("/rosters/fast/models/qwen35b")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(!body["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m == "qwen35b"));
+    }
+
+    #[tokio::test]
+    async fn operator_override_takes_precedence_over_inferred_profile_metadata() {
+        let app =
+            router(AppState::with_mock_residents(gov_config(), HashMap::new()).expect("state"));
+        // gemma-4-31b-it is not in the baseline; inference would give 31b.
+        let (status, body) = gov_send(
+            &app,
+            gov_req(
+                Method::PATCH,
+                "/catalog/models/gemma-4-31b-it",
+                serde_json::json!({"parameter_class":"27b","context_window":262144}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["parameter_class"], "27b");
+        assert_eq!(body["context_window"], 262144);
+        assert_eq!(body["metadata_source"], "operator_override");
+        // Untouched field falls through to the inferred family.
+        assert_eq!(body["family"], "gemma");
+    }
+
+    #[tokio::test]
+    async fn dashboard_roster_edit_rejects_empty_domain_roster() {
+        let app =
+            router(AppState::with_mock_residents(gov_config(), HashMap::new()).expect("state"));
+        let (status, body) = gov_send(
+            &app,
+            gov_req(
+                Method::PATCH,
+                "/domains/coding/rosters",
+                serde_json::json!({"rosters":[]}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body["error"]
+            .as_str()
+            .unwrap()
+            .contains("at least one roster"));
+    }
+
+    #[tokio::test]
+    async fn effective_policy_preview_includes_new_roster_model() {
+        let app =
+            router(AppState::with_mock_residents(gov_config(), HashMap::new()).expect("state"));
+        gov_send(
+            &app,
+            gov_req(
+                Method::POST,
+                "/rosters",
+                serde_json::json!({"id":"big2","models":["qwen35b"]}),
+            ),
+        )
+        .await;
+        gov_send(
+            &app,
+            gov_req(
+                Method::PATCH,
+                "/domains/coding/rosters",
+                serde_json::json!({"rosters":["fast","big2"]}),
+            ),
+        )
+        .await;
+
+        let (status, cfg) = gov_send(&app, gov_get("/policy/effective-config")).await;
+        assert_eq!(status, StatusCode::OK);
+        let rosters = cfg["domains"]["coding"]["rosters"].as_array().unwrap();
+        assert!(rosters.iter().any(|r| r == "big2"));
+        assert_eq!(cfg["residency_groups"]["big2"]["models"][0], "qwen35b");
+    }
+
+    #[tokio::test]
+    async fn llama_swap_config_is_read_only_discovery_input() {
+        // Governance edits never write a runtime's own config: the runtimes
+        // section of the effective config is unchanged after roster/profile edits.
+        let app =
+            router(AppState::with_mock_residents(gov_config(), HashMap::new()).expect("state"));
+        let (_, before) = gov_send(&app, gov_get("/policy/effective-config")).await;
+        gov_send(
+            &app,
+            gov_req(
+                Method::POST,
+                "/rosters",
+                serde_json::json!({"id":"x","models":["qwen9b"]}),
+            ),
+        )
+        .await;
+        gov_send(
+            &app,
+            gov_req(
+                Method::PATCH,
+                "/catalog/models/qwen9b",
+                serde_json::json!({"context_window":1024}),
+            ),
+        )
+        .await;
+        let (_, after) = gov_send(&app, gov_get("/policy/effective-config")).await;
+        assert_eq!(
+            before["runtimes"], after["runtimes"],
+            "roster/profile edits must not alter runtime config"
+        );
+    }
+
+    #[tokio::test]
+    async fn roster_edit_changes_candidate_generation_through_real_scheduler() {
+        // qwen35b is hot in the runtime but lives only in roster `big`, which the
+        // coding domain does not use — so coding decides on qwen9b...
+        let mut residents = HashMap::new();
+        residents.insert(
+            "rt".to_string(),
+            vec![ModelResident {
+                model_id: ModelId("qwen35b".into()),
+                state: ResidencyState::HotGpu,
+                vram_mb: None,
+                ram_mb: None,
+                kv_cache_mb: None,
+                loaded_since: None,
+            }],
+        );
+        let app = router(AppState::with_mock_residents(gov_config(), residents).expect("state"));
+
+        let decide_body = serde_json::json!({
+            "domain":"coding","mode":"interactive",
+            "prompt_tokens_estimate":1000,"max_output_tokens":500,
+            "latency_budget_ms":60000,"quality_floor":null
+        });
+        let (_, before) =
+            gov_send(&app, gov_req(Method::POST, "/decide", decide_body.clone())).await;
+        assert_eq!(before["selected_model"], "qwen9b");
+
+        // ...until the operator assigns the `big` roster (with qwen35b) to coding.
+        let (status, _) = gov_send(
+            &app,
+            gov_req(
+                Method::PATCH,
+                "/domains/coding/rosters",
+                serde_json::json!({"rosters":["fast","big"]}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (_, after) = gov_send(&app, gov_req(Method::POST, "/decide", decide_body)).await;
+        // The newly reachable hot 35B wins on its residency bonus — proof the
+        // roster edit flowed into the real scheduler.
+        assert_eq!(after["selected_model"], "qwen35b");
+        assert_eq!(after["action"], "reuse_hot");
+    }
+
+    #[tokio::test]
+    async fn delete_roster_is_rejected_while_a_domain_references_it() {
+        let app =
+            router(AppState::with_mock_residents(gov_config(), HashMap::new()).expect("state"));
+        let (status, body) = gov_send(&app, gov_del("/rosters/fast")).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(body["error"].as_str().unwrap().contains("coding"));
+
+        // An unreferenced roster deletes cleanly.
+        let (status, _) = gov_send(&app, gov_del("/rosters/big")).await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, list) = gov_send(&app, gov_get("/rosters")).await;
+        assert!(!list["rosters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["id"] == "big"));
+    }
+
+    #[tokio::test]
+    async fn validate_flags_domain_without_escalation_candidate() {
+        let app =
+            router(AppState::with_mock_residents(gov_config(), HashMap::new()).expect("state"));
+        let (status, body) = gov_send(&app, gov_get("/policy/validate")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w["code"] == "domain.no_escalation" && w["target"] == "coding"));
+    }
 }
 
 pub fn router(state: AppState) -> Router {
@@ -4611,12 +5001,616 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/openapi.json", get(openapi))
+        // Governance / roster management (issue #138). Mutations edit
+        // Anemoi-owned overrides only; they never load, unload, or otherwise
+        // mutate a runtime.
+        .route("/catalog/models", get(catalog_models))
+        .route("/catalog/models/:model_id", patch(set_model_profile))
+        .route("/rosters", get(list_rosters).post(create_roster))
+        .route(
+            "/rosters/:id",
+            get(get_roster).patch(patch_roster).delete(delete_roster),
+        )
+        .route("/rosters/:id/models", post(add_roster_model))
+        .route("/rosters/:id/models/:model_id", delete(remove_roster_model))
+        .route("/domains", get(list_domains))
+        .route("/domains/:id/rosters", patch(patch_domain_rosters))
+        .route("/policy/effective-config", get(effective_config))
+        .route("/policy/validate", get(validate_policy))
         .nest_service(
             "/dashboard",
             ServeDir::new(dashboard_assets).append_index_html_on_directories(true),
         )
         .layer(TraceLayer::new_for_http())
         .with_state(state)
+}
+
+// ── governance / roster management (issue #138) ─────────────────────────────
+//
+// These endpoints let operators curate Anemoi-owned governance (rosters,
+// residency groups, domain assignments, model profile overrides) from models
+// discovered in runtime catalogs. Runtime catalogs are read-only discovery
+// input; mutations edit Anemoi-owned overrides only and never load, unload, or
+// otherwise touch a runtime.
+
+#[derive(Serialize)]
+struct CatalogModel {
+    model_id: String,
+    runtime_id: String,
+    source_adapter: String,
+    /// True: the model is in the runtime catalog. NOT a residency claim.
+    configured: bool,
+    /// Populated only when the model is *separately* observed loaded.
+    resident_state: Option<String>,
+    family: String,
+    parameter_class: String,
+    context_window: Option<u32>,
+    supports_streaming: Option<bool>,
+    /// Where the effective profile metadata came from.
+    metadata_source: MetadataSource,
+    /// Effective residency groups (rosters) that currently include this model.
+    in_rosters: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct CatalogResponse {
+    models: Vec<CatalogModel>,
+    count: usize,
+    /// Explicit reminder that configured/catalog membership is not residency.
+    note: String,
+}
+
+#[derive(Serialize)]
+struct RosterView {
+    id: String,
+    purpose: Vec<String>,
+    models: Vec<String>,
+    keep_hot: bool,
+    allow_background_load: bool,
+    pinned: bool,
+    model_count: usize,
+    used_by_domains: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct RostersResponse {
+    rosters: Vec<RosterView>,
+    count: usize,
+}
+
+#[derive(Deserialize)]
+struct CreateRosterRequest {
+    id: String,
+    #[serde(default)]
+    purpose: Vec<String>,
+    #[serde(default)]
+    models: Vec<String>,
+    #[serde(default)]
+    keep_hot: bool,
+    #[serde(default)]
+    allow_background_load: bool,
+    #[serde(default)]
+    pinned: bool,
+}
+
+#[derive(Deserialize)]
+struct PatchRosterRequest {
+    purpose: Option<Vec<String>>,
+    models: Option<Vec<String>>,
+    keep_hot: Option<bool>,
+    allow_background_load: Option<bool>,
+    pinned: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct AddModelRequest {
+    model_id: String,
+}
+
+#[derive(Deserialize)]
+struct PatchDomainRostersRequest {
+    rosters: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct DomainView {
+    id: String,
+    rosters: Vec<String>,
+    live_roster: Option<String>,
+}
+
+#[derive(Serialize)]
+struct DomainsResponse {
+    domains: Vec<DomainView>,
+    count: usize,
+}
+
+#[derive(Serialize)]
+struct ValidateResponse {
+    ok: bool,
+    warnings: Vec<GovernanceWarning>,
+    count: usize,
+}
+
+fn governance_error_response(err: GovernanceError) -> Response {
+    let status = match err {
+        GovernanceError::NotFound(_) => StatusCode::NOT_FOUND,
+        GovernanceError::Conflict(_) => StatusCode::CONFLICT,
+        GovernanceError::Invalid(_) => StatusCode::BAD_REQUEST,
+        GovernanceError::Persist(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    (
+        status,
+        Json(serde_json::json!({ "error": err.to_string() })),
+    )
+        .into_response()
+}
+
+fn residency_state_label(state: &ResidencyState) -> String {
+    serde_json::to_value(state)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_else(|| format!("{state:?}"))
+}
+
+/// Resolve the *effective* roster for `id`: an operator override wins, a removed
+/// baseline roster resolves to `None`, otherwise the baseline group (as an
+/// editable override). Pure helper used inside `mutate` closures.
+fn current_roster(
+    overrides: &GovernanceOverrides,
+    baseline: &AnemoiConfig,
+    id: &ResidencyGroupId,
+) -> Option<RosterOverride> {
+    if let Some(roster) = overrides.residency_groups.get(id) {
+        return Some(roster.clone());
+    }
+    if overrides.removed_residency_groups.contains(id) {
+        return None;
+    }
+    baseline
+        .residency_groups
+        .get(id)
+        .map(RosterOverride::from_config)
+}
+
+fn roster_view(
+    id: &ResidencyGroupId,
+    group: &ResidencyGroupConfig,
+    config: &AnemoiConfig,
+) -> RosterView {
+    let used_by_domains = config
+        .domains
+        .iter()
+        .filter(|(_, domain)| domain.rosters.contains(id))
+        .map(|(domain_id, _)| domain_id.0.clone())
+        .collect();
+    RosterView {
+        id: id.0.clone(),
+        purpose: group.purpose.clone(),
+        models: group.models.iter().map(|m| m.0.clone()).collect(),
+        keep_hot: group.keep_hot,
+        allow_background_load: group.allow_background_load,
+        pinned: group.pinned,
+        model_count: group.models.len(),
+        used_by_domains,
+    }
+}
+
+/// Serialize the current effective roster `id` with the given status, or 404.
+fn roster_response(state: &AppState, id: &ResidencyGroupId, status: StatusCode) -> Response {
+    let effective = state.governance.effective();
+    match effective.config.residency_groups.get(id) {
+        Some(group) => (status, Json(roster_view(id, group, &effective.config))).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": format!("roster {} not found", id.0) })),
+        )
+            .into_response(),
+    }
+}
+
+async fn catalog_models(State(state): State<AppState>) -> Response {
+    if state.reconciler.needs_refresh().await {
+        state.run_reconciliation_tick().await;
+    }
+    let snapshots = state.reconciler.get_snapshots().await;
+    let effective = state.governance.effective();
+    let overrides = state.governance.overrides_snapshot();
+    let baseline = state.governance.baseline();
+
+    let mut models = Vec::new();
+    for snapshot in &snapshots {
+        let runtime_id = snapshot.runtime_id.0.clone();
+        let source_adapter = state
+            .runtime_adapter_type(&runtime_id)
+            .unwrap_or("unknown")
+            .to_string();
+        for model_id in &snapshot.configured_models {
+            let resident_state = snapshot
+                .residents
+                .iter()
+                .find(|resident| &resident.model_id == model_id)
+                .map(|resident| residency_state_label(&resident.state));
+
+            let profile = effective.config.models.get(model_id);
+            let metadata_source = if overrides.model_profiles.contains_key(model_id) {
+                MetadataSource::OperatorOverride
+            } else if baseline.models.contains_key(model_id) {
+                MetadataSource::Config
+            } else {
+                MetadataSource::Inferred
+            };
+            let (family, parameter_class) = match profile {
+                Some(profile) => (profile.family.clone(), profile.parameter_class.clone()),
+                None => anemoi_core::infer_family_and_class(&model_id.0),
+            };
+            let in_rosters = effective
+                .config
+                .residency_groups
+                .iter()
+                .filter(|(_, group)| group.models.contains(model_id))
+                .map(|(group_id, _)| group_id.0.clone())
+                .collect();
+
+            models.push(CatalogModel {
+                model_id: model_id.0.clone(),
+                runtime_id: runtime_id.clone(),
+                source_adapter: source_adapter.clone(),
+                configured: true,
+                resident_state,
+                family,
+                parameter_class,
+                context_window: profile.and_then(|p| p.context_window),
+                supports_streaming: profile.and_then(|p| p.supports_streaming),
+                metadata_source,
+                in_rosters,
+            });
+        }
+    }
+    models.sort_by(|a, b| {
+        a.runtime_id
+            .cmp(&b.runtime_id)
+            .then_with(|| a.model_id.cmp(&b.model_id))
+    });
+    let count = models.len();
+    Json(CatalogResponse {
+        models,
+        count,
+        note: "Catalog/configured models are discovered from runtime catalogs and are NOT residency evidence. resident_state is set only when a model is separately observed loaded.".to_string(),
+    })
+    .into_response()
+}
+
+async fn list_rosters(State(state): State<AppState>) -> Json<RostersResponse> {
+    let effective = state.governance.effective();
+    let mut rosters: Vec<RosterView> = effective
+        .config
+        .residency_groups
+        .iter()
+        .map(|(id, group)| roster_view(id, group, &effective.config))
+        .collect();
+    rosters.sort_by(|a, b| a.id.cmp(&b.id));
+    let count = rosters.len();
+    Json(RostersResponse { rosters, count })
+}
+
+async fn get_roster(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    roster_response(&state, &ResidencyGroupId(id), StatusCode::OK)
+}
+
+async fn create_roster(
+    State(state): State<AppState>,
+    Json(req): Json<CreateRosterRequest>,
+) -> Response {
+    let id = ResidencyGroupId(req.id.clone());
+    let result = state.governance.mutate(|overrides, baseline| {
+        if current_roster(overrides, baseline, &id).is_some() {
+            return Err(GovernanceError::Conflict(format!(
+                "roster {} already exists",
+                req.id
+            )));
+        }
+        overrides.removed_residency_groups.remove(&id);
+        overrides.residency_groups.insert(
+            id.clone(),
+            RosterOverride {
+                purpose: req.purpose.clone(),
+                models: req.models.iter().map(|m| ModelId(m.clone())).collect(),
+                keep_hot: req.keep_hot,
+                allow_background_load: req.allow_background_load,
+                pinned: req.pinned,
+            },
+        );
+        Ok(())
+    });
+    match result {
+        Ok(()) => roster_response(&state, &id, StatusCode::CREATED),
+        Err(err) => governance_error_response(err),
+    }
+}
+
+async fn patch_roster(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<PatchRosterRequest>,
+) -> Response {
+    let id = ResidencyGroupId(id);
+    let result = state.governance.mutate(|overrides, baseline| {
+        let Some(mut roster) = current_roster(overrides, baseline, &id) else {
+            return Err(GovernanceError::NotFound(format!("roster {}", id.0)));
+        };
+        if let Some(purpose) = &req.purpose {
+            roster.purpose = purpose.clone();
+        }
+        if let Some(model_list) = &req.models {
+            roster.models = model_list.iter().map(|m| ModelId(m.clone())).collect();
+        }
+        if let Some(value) = req.keep_hot {
+            roster.keep_hot = value;
+        }
+        if let Some(value) = req.allow_background_load {
+            roster.allow_background_load = value;
+        }
+        if let Some(value) = req.pinned {
+            roster.pinned = value;
+        }
+        overrides.removed_residency_groups.remove(&id);
+        overrides.residency_groups.insert(id.clone(), roster);
+        Ok(())
+    });
+    match result {
+        Ok(()) => roster_response(&state, &id, StatusCode::OK),
+        Err(err) => governance_error_response(err),
+    }
+}
+
+async fn delete_roster(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    let id = ResidencyGroupId(id);
+    let result = state.governance.mutate(|overrides, baseline| {
+        if current_roster(overrides, baseline, &id).is_none() {
+            return Err(GovernanceError::NotFound(format!("roster {}", id.0)));
+        }
+        // Refuse deletion while any domain still references the roster in the
+        // effective config, so a domain is never silently stranded.
+        let referencing: Vec<String> = baseline
+            .domains
+            .keys()
+            .filter(|domain_id| {
+                let rosters = overrides
+                    .domain_rosters
+                    .get(*domain_id)
+                    .cloned()
+                    .unwrap_or_else(|| baseline.domains[*domain_id].rosters.clone());
+                rosters.contains(&id)
+            })
+            .map(|domain_id| domain_id.0.clone())
+            .collect();
+        if !referencing.is_empty() {
+            return Err(GovernanceError::Conflict(format!(
+                "roster {} is still assigned to domain(s): {}",
+                id.0,
+                referencing.join(", ")
+            )));
+        }
+        overrides.residency_groups.remove(&id);
+        overrides.removed_residency_groups.insert(id.clone());
+        Ok(())
+    });
+    match result {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "deleted": id.0 }))).into_response(),
+        Err(err) => governance_error_response(err),
+    }
+}
+
+async fn add_roster_model(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<AddModelRequest>,
+) -> Response {
+    let id = ResidencyGroupId(id);
+    let model = ModelId(req.model_id.clone());
+    let result = state.governance.mutate(|overrides, baseline| {
+        let Some(mut roster) = current_roster(overrides, baseline, &id) else {
+            return Err(GovernanceError::NotFound(format!("roster {}", id.0)));
+        };
+        // Adding a model to a roster is a policy edit only; it must NOT load the
+        // model into any runtime.
+        if !roster.models.contains(&model) {
+            roster.models.push(model.clone());
+        }
+        overrides.removed_residency_groups.remove(&id);
+        overrides.residency_groups.insert(id.clone(), roster);
+        Ok(())
+    });
+    match result {
+        Ok(()) => roster_response(&state, &id, StatusCode::OK),
+        Err(err) => governance_error_response(err),
+    }
+}
+
+async fn remove_roster_model(
+    State(state): State<AppState>,
+    Path((id, model_id)): Path<(String, String)>,
+) -> Response {
+    let id = ResidencyGroupId(id);
+    let model = ModelId(model_id);
+    let result = state.governance.mutate(|overrides, baseline| {
+        let Some(mut roster) = current_roster(overrides, baseline, &id) else {
+            return Err(GovernanceError::NotFound(format!("roster {}", id.0)));
+        };
+        // Removing a model from a roster is a policy edit only; it must NOT
+        // unload the model from any runtime.
+        roster.models.retain(|m| m != &model);
+        overrides.removed_residency_groups.remove(&id);
+        overrides.residency_groups.insert(id.clone(), roster);
+        Ok(())
+    });
+    match result {
+        Ok(()) => roster_response(&state, &id, StatusCode::OK),
+        Err(err) => governance_error_response(err),
+    }
+}
+
+fn domain_view(id: &DomainId, config: &AnemoiConfig) -> Option<DomainView> {
+    config.domains.get(id).map(|domain| DomainView {
+        id: id.0.clone(),
+        rosters: domain.rosters.iter().map(|r| r.0.clone()).collect(),
+        live_roster: domain.live_roster.as_ref().map(|r| r.0.clone()),
+    })
+}
+
+async fn list_domains(State(state): State<AppState>) -> Json<DomainsResponse> {
+    let effective = state.governance.effective();
+    let mut domains: Vec<DomainView> = effective
+        .config
+        .domains
+        .keys()
+        .filter_map(|id| domain_view(id, &effective.config))
+        .collect();
+    domains.sort_by(|a, b| a.id.cmp(&b.id));
+    let count = domains.len();
+    Json(DomainsResponse { domains, count })
+}
+
+async fn patch_domain_rosters(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<PatchDomainRostersRequest>,
+) -> Response {
+    let domain_id = DomainId(id);
+    let result = state.governance.mutate(|overrides, baseline| {
+        if !baseline.domains.contains_key(&domain_id) {
+            return Err(GovernanceError::NotFound(format!("domain {}", domain_id.0)));
+        }
+        // A static-roster domain must keep at least one roster or it can produce
+        // no candidates. (A live_roster domain may legitimately have none.)
+        if req.rosters.is_empty() && baseline.domains[&domain_id].live_roster.is_none() {
+            return Err(GovernanceError::Invalid(format!(
+                "domain {} would have no rosters and no live_roster; assign at least one roster",
+                domain_id.0
+            )));
+        }
+        let rosters: Vec<ResidencyGroupId> = req
+            .rosters
+            .iter()
+            .map(|r| ResidencyGroupId(r.clone()))
+            .collect();
+        for roster_id in &rosters {
+            if current_roster(overrides, baseline, roster_id).is_none() {
+                return Err(GovernanceError::Invalid(format!(
+                    "roster {} is not defined; create it before assigning it",
+                    roster_id.0
+                )));
+            }
+        }
+        overrides.domain_rosters.insert(domain_id.clone(), rosters);
+        Ok(())
+    });
+    match result {
+        Ok(()) => {
+            let effective = state.governance.effective();
+            match domain_view(&domain_id, &effective.config) {
+                Some(view) => (StatusCode::OK, Json(view)).into_response(),
+                None => governance_error_response(GovernanceError::NotFound(format!(
+                    "domain {}",
+                    domain_id.0
+                ))),
+            }
+        }
+        Err(err) => governance_error_response(err),
+    }
+}
+
+#[derive(Serialize)]
+struct ModelProfileView {
+    model_id: String,
+    family: String,
+    parameter_class: String,
+    context_window: Option<u32>,
+    vram_required_mb: Option<u64>,
+    ram_required_mb: Option<u64>,
+    cold_load_estimate_ms: Option<u64>,
+    supports_streaming: Option<bool>,
+    supported_runtimes: Vec<String>,
+    metadata_source: MetadataSource,
+}
+
+/// Set (or clear, when empty) an operator profile override for a model. The
+/// override takes precedence over inferred and baseline-config metadata. This
+/// edits Anemoi-owned governance only; it never touches the runtime.
+async fn set_model_profile(
+    State(state): State<AppState>,
+    Path(model_id): Path<String>,
+    Json(req): Json<ModelProfileOverride>,
+) -> Response {
+    let model = ModelId(model_id);
+    let result = state.governance.mutate(|overrides, _baseline| {
+        if req.is_empty() {
+            overrides.model_profiles.remove(&model);
+        } else {
+            overrides.model_profiles.insert(model.clone(), req.clone());
+        }
+        Ok(())
+    });
+    match result {
+        Ok(()) => {
+            let effective = state.governance.effective();
+            let profile = effective.config.models.get(&model);
+            let (family, parameter_class) = match profile {
+                Some(profile) => (profile.family.clone(), profile.parameter_class.clone()),
+                None => anemoi_core::infer_family_and_class(&model.0),
+            };
+            let metadata_source = if state
+                .governance
+                .overrides_snapshot()
+                .model_profiles
+                .contains_key(&model)
+            {
+                MetadataSource::OperatorOverride
+            } else if state.governance.baseline().models.contains_key(&model) {
+                MetadataSource::Config
+            } else {
+                MetadataSource::Inferred
+            };
+            let view = ModelProfileView {
+                model_id: model.0.clone(),
+                family,
+                parameter_class,
+                context_window: profile.and_then(|p| p.context_window),
+                vram_required_mb: profile.and_then(|p| p.vram_required_mb),
+                ram_required_mb: profile.and_then(|p| p.ram_required_mb),
+                cold_load_estimate_ms: profile.and_then(|p| p.cold_load_estimate_ms),
+                supports_streaming: profile.and_then(|p| p.supports_streaming),
+                supported_runtimes: profile
+                    .map(|p| p.supported_runtimes.iter().map(|r| r.0.clone()).collect())
+                    .unwrap_or_default(),
+                metadata_source,
+            };
+            (StatusCode::OK, Json(view)).into_response()
+        }
+        Err(err) => governance_error_response(err),
+    }
+}
+
+async fn effective_config(State(state): State<AppState>) -> Json<AnemoiConfig> {
+    let mut config = state.governance.effective().config.clone();
+    // Never expose runtime auth tokens through the governance surface.
+    for runtime in config.runtimes.values_mut() {
+        if runtime.auth_token.is_some() {
+            runtime.auth_token = Some("<redacted>".to_string());
+        }
+    }
+    Json(config)
+}
+
+async fn validate_policy(State(state): State<AppState>) -> Json<ValidateResponse> {
+    let warnings = state.governance.warnings();
+    let count = warnings.len();
+    Json(ValidateResponse {
+        ok: count == 0,
+        warnings,
+        count,
+    })
 }
 
 pub async fn serve(addr: SocketAddr, state: AppState) -> anyhow::Result<()> {

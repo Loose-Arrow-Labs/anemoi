@@ -40,6 +40,20 @@ history where available.
 The telemetry endpoints are read-only. Runtime mutation remains behind existing
 execution paths and the `ANEMOI_ENABLE_LIVE_EXECUTE=1` gate.
 
+## Governance Tab
+
+The **Governance** tab lets operators curate rosters and residency groups from
+models discovered in runtime catalogs — create/delete rosters, set
+keep-hot/background/pinned flags, add/remove models, assign rosters to domains,
+and edit model profile metadata. Roster edits take effect on the next `/decide`
+through the real scheduler, and they never load, unload, or mutate a runtime.
+
+These edits use a separate set of read-only and mutation endpoints
+(`/catalog/models`, `/rosters`, `/domains`, `/policy/effective-config`,
+`/policy/validate`, …). Override semantics, persistence
+(`ANEMOI_GOVERNANCE_OVERRIDES`), the safety boundary, and the full API are
+documented in [`GOVERNANCE.md`](GOVERNANCE.md).
+
 ## Build
 
 ```powershell
