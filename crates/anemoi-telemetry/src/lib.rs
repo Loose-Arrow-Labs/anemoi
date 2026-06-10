@@ -722,6 +722,7 @@ mod tests {
             configured_models: vec![],
             memory: anemoi_core::RuntimeMemorySnapshot::default(),
             active_requests: Vec::new(),
+            colocation: None,
         }
     }
 

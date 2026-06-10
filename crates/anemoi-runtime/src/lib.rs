@@ -1,6 +1,6 @@
 use anemoi_core::{
-    ActiveExecution, ExecutionRequest, ModelId, ModelResident, ResidencyState, RuntimeId,
-    RuntimeMemorySnapshot, RuntimeSnapshot,
+    ActiveExecution, ColocationConstraints, ExecutionRequest, ModelId, ModelResident,
+    ResidencyState, RuntimeId, RuntimeMemorySnapshot, RuntimeSnapshot,
 };
 use async_trait::async_trait;
 use chrono::Utc;
@@ -79,6 +79,7 @@ impl MockRuntimeAdapter {
                 configured_models: Vec::new(),
                 memory: RuntimeMemorySnapshot::default(),
                 active_requests: Vec::new(),
+                colocation: None,
             })),
         }
     }
@@ -228,6 +229,7 @@ impl RuntimeAdapter for OllamaAdapter {
                 configured_models: Vec::new(),
                 memory: RuntimeMemorySnapshot::default(),
                 active_requests: Vec::new(),
+                colocation: None,
             });
         }
 
@@ -252,6 +254,7 @@ impl RuntimeAdapter for OllamaAdapter {
             configured_models: Vec::new(),
             memory: RuntimeMemorySnapshot::default(),
             active_requests: Vec::new(),
+            colocation: None,
         })
     }
 
@@ -392,6 +395,7 @@ impl RuntimeAdapter for LlamaCppAdapter {
                 configured_models: Vec::new(),
                 memory: RuntimeMemorySnapshot::default(),
                 active_requests: Vec::new(),
+                colocation: None,
             });
         }
 
@@ -418,6 +422,7 @@ impl RuntimeAdapter for LlamaCppAdapter {
             configured_models,
             memory: RuntimeMemorySnapshot::default(),
             active_requests: Vec::new(),
+            colocation: None,
         })
     }
 
@@ -510,6 +515,16 @@ impl LlamaSwapAdapter {
         self.matrix
             .as_ref()
             .is_some_and(|matrix| matrix.can_colocate(a, b))
+    }
+
+    /// Colocation feasibility for the scheduling policy, surfaced onto the
+    /// observed snapshot. `None` when matrix awareness is disabled (no config
+    /// supplied), leaving colocation unknown so the policy applies no
+    /// constraint; `Some` lowers the parsed matrix into the policy-facing form.
+    pub fn colocation_constraints(&self) -> Option<ColocationConstraints> {
+        self.matrix
+            .as_ref()
+            .map(LlamaSwapMatrixConfig::colocation_constraints)
     }
 
     /// Read handle to the push-updated model-state cache. Empty until an event
@@ -708,6 +723,23 @@ impl LlamaSwapMatrixConfig {
             .iter()
             .flat_map(|set| set.loadouts_with_vars(&vars))
             .any(|loadout| loadout.contains(&a.0) && loadout.contains(&b.0))
+    }
+
+    /// Lower the parsed matrix into a runtime-agnostic [`ColocationConstraints`]
+    /// the scheduling policy can consume off the observed snapshot. Each
+    /// declared colocation set contributes one loadout per `|` branch of its DSL
+    /// expression; the model ids within each loadout are sorted and
+    /// deduplicated (they come from a `BTreeSet`).
+    pub fn colocation_constraints(&self) -> ColocationConstraints {
+        let vars = self.string_vars();
+        ColocationConstraints {
+            loadouts: self
+                .sets
+                .iter()
+                .flat_map(|set| set.loadouts_with_vars(&vars))
+                .map(|loadout| loadout.into_iter().map(ModelId).collect())
+                .collect(),
+        }
     }
 }
 
@@ -1095,6 +1127,7 @@ impl RuntimeAdapter for LlamaSwapAdapter {
                 configured_models: Vec::new(),
                 memory: RuntimeMemorySnapshot::default(),
                 active_requests: Vec::new(),
+                colocation: None,
             });
         }
 
@@ -1129,6 +1162,7 @@ impl RuntimeAdapter for LlamaSwapAdapter {
             configured_models,
             memory: RuntimeMemorySnapshot::default(),
             active_requests: Vec::new(),
+            colocation: self.colocation_constraints(),
         })
     }
 
@@ -1203,6 +1237,7 @@ impl RuntimeAdapter for HttpInspectAdapter {
             configured_models: Vec::new(),
             memory: RuntimeMemorySnapshot::default(),
             active_requests: Vec::new(),
+            colocation: None,
         })
     }
 
@@ -2574,6 +2609,36 @@ matrix:
 
         assert!(matrix.can_colocate(&m("qwen9b"), &m("qwen35_a3b")));
         assert!(matrix.can_colocate(&m("qwen35_a3b"), &m("qwen9b")));
+    }
+
+    #[test]
+    fn matrix_lowers_to_policy_facing_colocation_constraints() {
+        let matrix = LlamaSwapMatrixConfig::from_yaml_str(
+            r#"
+matrix:
+  sets:
+    - name: pair
+      models: qwen9b & qwen35_a3b
+    - name: solo
+      models: minimax
+"#,
+        )
+        .expect("parse")
+        .expect("matrix");
+
+        // The lowered, runtime-agnostic form answers the same colocation
+        // questions as the matrix itself — this is what the policy consumes off
+        // the observed snapshot.
+        let constraints = matrix.colocation_constraints();
+        assert!(constraints.can_colocate(&m("qwen9b"), &m("qwen35_a3b")));
+        assert!(!constraints.can_colocate(&m("qwen9b"), &m("minimax")));
+    }
+
+    #[test]
+    fn adapter_surfaces_no_colocation_constraints_without_matrix() {
+        let adapter = LlamaSwapAdapter::new(RuntimeId("ls".to_string()), "http://localhost:8085")
+            .expect("adapter");
+        assert!(adapter.colocation_constraints().is_none());
     }
 
     #[test]
