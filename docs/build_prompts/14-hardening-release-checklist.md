@@ -22,9 +22,9 @@ Required checks:
 Hardening tasks:
 
 - update README with exact v1 capabilities
-- update setup docs to Rust commands instead of legacy .NET commands
-- document legacy .NET surface as `Needs validation` or archive it if a
-  maintainer explicitly approves
+- update setup docs to Rust commands instead of previous service commands
+- document any retired surface clearly or archive it if a maintainer explicitly
+  approves
 - document environment variables
 - document local binding defaults
 - document optional JSONL decision log
@@ -54,4 +54,3 @@ cargo fmt --check
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```
-

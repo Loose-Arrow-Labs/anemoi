@@ -1,6 +1,6 @@
 use anemoi_core::{
-    ActiveExecution, ExecutionRequest, ModelId, ModelResident, ResidencyState, RuntimeId,
-    RuntimeMemorySnapshot, RuntimeSnapshot,
+    ActiveExecution, ColocationConstraints, ExecutionRequest, ModelId, ModelResident,
+    ResidencyState, RuntimeId, RuntimeMemorySnapshot, RuntimeSnapshot,
 };
 use async_trait::async_trait;
 use chrono::Utc;
@@ -79,6 +79,7 @@ impl MockRuntimeAdapter {
                 configured_models: Vec::new(),
                 memory: RuntimeMemorySnapshot::default(),
                 active_requests: Vec::new(),
+                colocation: None,
             })),
         }
     }
@@ -228,6 +229,7 @@ impl RuntimeAdapter for OllamaAdapter {
                 configured_models: Vec::new(),
                 memory: RuntimeMemorySnapshot::default(),
                 active_requests: Vec::new(),
+                colocation: None,
             });
         }
 
@@ -252,6 +254,7 @@ impl RuntimeAdapter for OllamaAdapter {
             configured_models: Vec::new(),
             memory: RuntimeMemorySnapshot::default(),
             active_requests: Vec::new(),
+            colocation: None,
         })
     }
 
@@ -392,6 +395,7 @@ impl RuntimeAdapter for LlamaCppAdapter {
                 configured_models: Vec::new(),
                 memory: RuntimeMemorySnapshot::default(),
                 active_requests: Vec::new(),
+                colocation: None,
             });
         }
 
@@ -418,6 +422,7 @@ impl RuntimeAdapter for LlamaCppAdapter {
             configured_models,
             memory: RuntimeMemorySnapshot::default(),
             active_requests: Vec::new(),
+            colocation: None,
         })
     }
 
@@ -512,6 +517,16 @@ impl LlamaSwapAdapter {
             .is_some_and(|matrix| matrix.can_colocate(a, b))
     }
 
+    /// Colocation feasibility for the scheduling policy, surfaced onto the
+    /// observed snapshot. `None` when matrix awareness is disabled (no config
+    /// supplied), leaving colocation unknown so the policy applies no
+    /// constraint; `Some` lowers the parsed matrix into the policy-facing form.
+    pub fn colocation_constraints(&self) -> Option<ColocationConstraints> {
+        self.matrix
+            .as_ref()
+            .map(LlamaSwapMatrixConfig::colocation_constraints)
+    }
+
     /// Read handle to the push-updated model-state cache. Empty until an event
     /// stream is started via [`LlamaSwapAdapter::start_event_stream`] and the
     /// first `modelStatus` frame arrives.
@@ -571,6 +586,56 @@ impl LlamaSwapAdapter {
     }
 }
 
+/// A value in the llama-swap matrix `vars` block. llama-swap allows two kinds:
+/// numeric budget values (`gpu: 24576` for total VRAM in MB) and string
+/// aliases for model ids used in set expressions (`g31: gemma-4-31b-it`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(untagged)]
+pub enum MatrixVar {
+    Uint(u64),
+    String(String),
+}
+
+/// Deserializes the `sets` field from either the llama-swap list format
+/// (`[{name: ..., models: ...}]`) or the mapping format (`{name: expr}`).
+fn deserialize_colocation_sets<'de, D>(deserializer: D) -> Result<Vec<ColocationSet>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{MapAccess, SeqAccess, Visitor};
+
+    struct ColocationSetsVisitor;
+
+    impl<'de> Visitor<'de> for ColocationSetsVisitor {
+        type Value = Vec<ColocationSet>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            write!(
+                f,
+                "a sequence of {{name, models}} objects or a name-to-expression mapping"
+            )
+        }
+
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+            let mut sets = Vec::new();
+            while let Some(set) = seq.next_element::<ColocationSet>()? {
+                sets.push(set);
+            }
+            Ok(sets)
+        }
+
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+            let mut sets = Vec::new();
+            while let Some((name, models)) = map.next_entry::<String, String>()? {
+                sets.push(ColocationSet { name, models });
+            }
+            Ok(sets)
+        }
+    }
+
+    deserializer.deserialize_any(ColocationSetsVisitor)
+}
+
 /// The `matrix` block of a llama-swap YAML config. llama-swap does not expose
 /// this over its API, so Anemoi reads the file directly (both run on the same
 /// host). Anemoi reads the colocation sets to answer feasibility questions; it
@@ -578,15 +643,17 @@ impl LlamaSwapAdapter {
 /// `evict_costs` are retained verbatim for callers that want the raw numbers.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 pub struct LlamaSwapMatrixConfig {
-    /// Free-form numeric variables (e.g. `gpu: 24576` for total VRAM in MB).
+    /// Free-form variables: numeric budget values (`gpu: 24576`) or string
+    /// aliases for model ids used in set expressions (`g31: gemma-4-31b-it`).
     #[serde(default)]
-    pub vars: HashMap<String, u64>,
-    /// Per-model cold-load cost estimates in milliseconds, keyed by model id.
+    pub vars: HashMap<String, MatrixVar>,
+    /// Per-model cold-load cost estimates in milliseconds, keyed by model id
+    /// (or a var alias when the config uses shorthand names).
     #[serde(default)]
     pub evict_costs: HashMap<String, u64>,
-    /// Declared colocation sets. Each set's `models` expression names the
-    /// models that may be GPU-resident together.
-    #[serde(default)]
+    /// Declared colocation sets. Supports both llama-swap formats: a sequence
+    /// of `{name, models}` objects, or a mapping from set name to expression.
+    #[serde(default, deserialize_with = "deserialize_colocation_sets")]
     pub sets: Vec<ColocationSet>,
 }
 
@@ -626,24 +693,69 @@ impl LlamaSwapMatrixConfig {
         Ok(file.matrix)
     }
 
+    /// Value of a numeric var (e.g. `gpu: 24576` for total VRAM in MB).
+    pub fn numeric_var(&self, key: &str) -> Option<u64> {
+        match self.vars.get(key)? {
+            MatrixVar::Uint(n) => Some(*n),
+            _ => None,
+        }
+    }
+
+    /// String-valued vars as an alias map, for expanding shorthand names in
+    /// set expressions before model-ID comparison (e.g. `g31 → gemma-4-31b-it`).
+    fn string_vars(&self) -> HashMap<&str, &str> {
+        self.vars
+            .iter()
+            .filter_map(|(k, v)| match v {
+                MatrixVar::String(s) => Some((k.as_str(), s.as_str())),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Whether `a` and `b` may be GPU-resident at the same time: `true` when
     /// some colocation set admits a loadout containing both. Models joined only
-    /// by `|` are alternatives and do not colocate on that basis.
+    /// by `|` are alternatives and do not colocate on that basis. Var aliases
+    /// in set expressions (e.g. `g31`) are expanded via the `vars` map.
     pub fn can_colocate(&self, a: &ModelId, b: &ModelId) -> bool {
+        let vars = self.string_vars();
         self.sets
             .iter()
-            .flat_map(|set| set.loadouts())
+            .flat_map(|set| set.loadouts_with_vars(&vars))
             .any(|loadout| loadout.contains(&a.0) && loadout.contains(&b.0))
+    }
+
+    /// Lower the parsed matrix into a runtime-agnostic [`ColocationConstraints`]
+    /// the scheduling policy can consume off the observed snapshot. Each
+    /// declared colocation set contributes one loadout per `|` branch of its DSL
+    /// expression; the model ids within each loadout are sorted and
+    /// deduplicated (they come from a `BTreeSet`).
+    pub fn colocation_constraints(&self) -> ColocationConstraints {
+        let vars = self.string_vars();
+        ColocationConstraints {
+            loadouts: self
+                .sets
+                .iter()
+                .flat_map(|set| set.loadouts_with_vars(&vars))
+                .map(|loadout| loadout.into_iter().map(ModelId).collect())
+                .collect(),
+        }
     }
 }
 
 impl ColocationSet {
-    /// Co-resident loadouts implied by this set's `models` DSL expression: each
-    /// returned group is a set of model ids that may be resident together. An
-    /// all-`&` expression yields one group; `|` branches yield one group per
-    /// alternative. A malformed expression yields no groups.
-    fn loadouts(&self) -> Vec<BTreeSet<String>> {
-        parse_colocation_expr(&self.models)
+    /// Co-resident loadouts implied by this set's `models` DSL expression,
+    /// with var aliases expanded via `vars`. Each returned group is a set of
+    /// model ids that may be resident together. An all-`&` expression yields
+    /// one group; `|` branches yield one group per alternative. A malformed
+    /// expression yields no groups.
+    ///
+    /// Pass an empty map when no alias expansion is needed.
+    fn loadouts_with_vars(&self, vars: &HashMap<&str, &str>) -> Vec<BTreeSet<String>> {
+        let tokens = tokenize_colocation_expr(&self.models);
+        let mut pos = 0;
+        let loadouts = parse_or(&tokens, &mut pos, vars);
+        dedup_loadouts(loadouts)
     }
 }
 
@@ -688,46 +800,47 @@ fn tokenize_colocation_expr(expr: &str) -> Vec<MatrixToken> {
     tokens
 }
 
-/// Parses a matrix colocation DSL expression into its co-resident loadouts.
-/// Grammar: `expr := term ('|' term)*`, `term := factor ('&' factor)*`,
-/// `factor := IDENT | '(' expr ')'`. `&` unions loadouts (co-resident); `|`
-/// concatenates them (alternatives). Parsing is lenient: unbalanced or empty
-/// input yields no loadouts rather than erroring.
-fn parse_colocation_expr(expr: &str) -> Vec<BTreeSet<String>> {
-    let tokens = tokenize_colocation_expr(expr);
-    let mut pos = 0;
-    let loadouts = parse_or(&tokens, &mut pos);
-    dedup_loadouts(loadouts)
-}
-
-fn parse_or(tokens: &[MatrixToken], pos: &mut usize) -> Vec<BTreeSet<String>> {
-    let mut loadouts = parse_and(tokens, pos);
+fn parse_or(
+    tokens: &[MatrixToken],
+    pos: &mut usize,
+    vars: &HashMap<&str, &str>,
+) -> Vec<BTreeSet<String>> {
+    let mut loadouts = parse_and(tokens, pos, vars);
     while matches!(tokens.get(*pos), Some(MatrixToken::Or)) {
         *pos += 1;
-        loadouts.extend(parse_and(tokens, pos));
+        loadouts.extend(parse_and(tokens, pos, vars));
     }
     loadouts
 }
 
-fn parse_and(tokens: &[MatrixToken], pos: &mut usize) -> Vec<BTreeSet<String>> {
-    let mut loadouts = parse_factor(tokens, pos);
+fn parse_and(
+    tokens: &[MatrixToken],
+    pos: &mut usize,
+    vars: &HashMap<&str, &str>,
+) -> Vec<BTreeSet<String>> {
+    let mut loadouts = parse_factor(tokens, pos, vars);
     while matches!(tokens.get(*pos), Some(MatrixToken::And)) {
         *pos += 1;
-        let rhs = parse_factor(tokens, pos);
+        let rhs = parse_factor(tokens, pos, vars);
         loadouts = cross_union(&loadouts, &rhs);
     }
     loadouts
 }
 
-fn parse_factor(tokens: &[MatrixToken], pos: &mut usize) -> Vec<BTreeSet<String>> {
+fn parse_factor(
+    tokens: &[MatrixToken],
+    pos: &mut usize,
+    vars: &HashMap<&str, &str>,
+) -> Vec<BTreeSet<String>> {
     match tokens.get(*pos) {
         Some(MatrixToken::Ident(id)) => {
             *pos += 1;
-            vec![BTreeSet::from([id.clone()])]
+            let resolved = vars.get(id.as_str()).copied().unwrap_or(id.as_str());
+            vec![BTreeSet::from([resolved.to_string()])]
         }
         Some(MatrixToken::Open) => {
             *pos += 1;
-            let inner = parse_or(tokens, pos);
+            let inner = parse_or(tokens, pos, vars);
             if matches!(tokens.get(*pos), Some(MatrixToken::Close)) {
                 *pos += 1;
             }
@@ -1014,6 +1127,7 @@ impl RuntimeAdapter for LlamaSwapAdapter {
                 configured_models: Vec::new(),
                 memory: RuntimeMemorySnapshot::default(),
                 active_requests: Vec::new(),
+                colocation: None,
             });
         }
 
@@ -1048,6 +1162,7 @@ impl RuntimeAdapter for LlamaSwapAdapter {
             configured_models,
             memory: RuntimeMemorySnapshot::default(),
             active_requests: Vec::new(),
+            colocation: self.colocation_constraints(),
         })
     }
 
@@ -1122,6 +1237,7 @@ impl RuntimeAdapter for HttpInspectAdapter {
             configured_models: Vec::new(),
             memory: RuntimeMemorySnapshot::default(),
             active_requests: Vec::new(),
+            colocation: None,
         })
     }
 
@@ -2470,7 +2586,7 @@ matrix:
         .expect("parse")
         .expect("matrix block present");
 
-        assert_eq!(matrix.vars.get("gpu"), Some(&24_576));
+        assert_eq!(matrix.numeric_var("gpu"), Some(24_576));
         assert_eq!(matrix.evict_costs.get("minimax"), Some(&90_000));
         assert_eq!(matrix.evict_costs.get("qwen9b"), Some(&1));
         assert_eq!(matrix.sets.len(), 1);
@@ -2493,6 +2609,36 @@ matrix:
 
         assert!(matrix.can_colocate(&m("qwen9b"), &m("qwen35_a3b")));
         assert!(matrix.can_colocate(&m("qwen35_a3b"), &m("qwen9b")));
+    }
+
+    #[test]
+    fn matrix_lowers_to_policy_facing_colocation_constraints() {
+        let matrix = LlamaSwapMatrixConfig::from_yaml_str(
+            r#"
+matrix:
+  sets:
+    - name: pair
+      models: qwen9b & qwen35_a3b
+    - name: solo
+      models: minimax
+"#,
+        )
+        .expect("parse")
+        .expect("matrix");
+
+        // The lowered, runtime-agnostic form answers the same colocation
+        // questions as the matrix itself — this is what the policy consumes off
+        // the observed snapshot.
+        let constraints = matrix.colocation_constraints();
+        assert!(constraints.can_colocate(&m("qwen9b"), &m("qwen35_a3b")));
+        assert!(!constraints.can_colocate(&m("qwen9b"), &m("minimax")));
+    }
+
+    #[test]
+    fn adapter_surfaces_no_colocation_constraints_without_matrix() {
+        let adapter = LlamaSwapAdapter::new(RuntimeId("ls".to_string()), "http://localhost:8085")
+            .expect("adapter");
+        assert!(adapter.colocation_constraints().is_none());
     }
 
     #[test]
@@ -2577,6 +2723,47 @@ matrix:
         // Model ids carry the `-co` colocation suffix verbatim from the config.
         assert!(matrix.can_colocate(&m("qwen9b-co"), &m("qwen35_a3b-co")));
         assert!(!matrix.can_colocate(&m("qwen9b-co"), &m("minimax")));
+    }
+
+    #[test]
+    fn dict_format_sets_parse_like_list_format() {
+        let matrix = LlamaSwapMatrixConfig::from_yaml_str(
+            r#"
+matrix:
+  sets:
+    pair: qwen9b & qwen35_a3b
+"#,
+        )
+        .expect("parse")
+        .expect("matrix");
+
+        assert!(matrix.can_colocate(&m("qwen9b"), &m("qwen35_a3b")));
+        assert!(!matrix.can_colocate(&m("qwen9b"), &m("minimax")));
+    }
+
+    #[test]
+    fn string_var_aliases_expand_in_colocation_check() {
+        let matrix = LlamaSwapMatrixConfig::from_yaml_str(
+            r#"
+matrix:
+  vars:
+    q9m: qwen3.5-9b-mtp
+    q35co: qwen3.6-35b-a3b-mtp-co
+    ge2m: gemma-4-e2b-it
+  sets:
+    small_pair: q9m & q35co
+    big_pool: q35co | ge2m
+"#,
+        )
+        .expect("parse")
+        .expect("matrix");
+
+        // Aliases expand to full model IDs for can_colocate.
+        assert!(matrix.can_colocate(&m("qwen3.5-9b-mtp"), &m("qwen3.6-35b-a3b-mtp-co")));
+        // | alternatives do not colocate even after alias expansion.
+        assert!(!matrix.can_colocate(&m("qwen3.6-35b-a3b-mtp-co"), &m("gemma-4-e2b-it")));
+        // Models not in any & set never colocate.
+        assert!(!matrix.can_colocate(&m("qwen3.5-9b-mtp"), &m("gemma-4-e2b-it")));
     }
 
     #[test]

@@ -398,7 +398,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 - **Gateway**: OpenAI-compatible inference endpoint active ✅
 - **Telemetry**: SQLite event store recording all decisions ✅
 - **Documentation**: Guides and examples complete ✅
-- **Legacy Surface**: `.NET`/C# files in `src/Anemoi.*` marked as `Needs validation`
+- **Repository Surface**: Rust workspace only; older parallel service files have been removed
 - **Local-First**: By default, services bind to loopback (configurable via `anemoi.home.arpa`)
 
 ---

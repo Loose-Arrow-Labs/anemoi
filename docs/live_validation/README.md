@@ -7,9 +7,11 @@ of Anemoi against real runtimes.
 
 | File | Purpose |
 |---|---|
+| `llama-swap-live-path.md` | End-to-end validation report for one real llama-swap live path: config, inspect, decide, and controlled-execution gate, with sanitized evidence. |
 | `safety-plan.md` | Permission boundary, operator inputs, and procedure for read-only live validation. |
-| `TBD` | Read-only probe results will be recorded here after prompt 16. |
-| `TBD` | Live decision smoke results will be recorded here after prompt 19. |
+| `llama-swap-probe.md` | Read-only HTTP probe procedure for a llama-swap runtime. |
+| `controlled-execution-gate.md` | The `ANEMOI_ENABLE_LIVE_EXECUTE` boundary for non-mock mutation and forwarding. |
+| `residency-truth-contract.md` | Why configured models are not residency evidence. |
 
 ## Phase Policy
 
