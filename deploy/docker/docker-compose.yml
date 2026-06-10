@@ -1,9 +1,12 @@
 services:
-  anemoi-router:
+  anemoi-daemon:
     build:
       context: ../..
       dockerfile: deploy/docker/Dockerfile
     ports:
-      - "8080:8080"
+      - "7070:7070"
+    environment:
+      ANEMOI_BIND: "0.0.0.0:7070"
+      ANEMOI_CONFIG: "/app/config/anemoi.example.yaml"
     volumes:
-      - ../config/appsettings.example.json:/app/appsettings.json:ro
+      - ../../config:/app/config:ro

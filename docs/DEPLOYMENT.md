@@ -199,10 +199,16 @@ docker build -t anemoi:latest .
 docker run -d \
   --name anemoi \
   -p 7070:7070 \
+  -e ANEMOI_BIND=0.0.0.0:7070 \
+  -e ANEMOI_CONFIG=/etc/anemoi/anemoi.yaml \
   -v /etc/anemoi:/etc/anemoi \
   -v /var/lib/anemoi:/var/lib/anemoi \
   anemoi:latest
 ```
+
+For the checked-in compose file, use `deploy/docker/docker-compose.yml`; it
+builds `anemoi-daemon`, mounts the repository `config/` directory read-only,
+and maps host port `7070` to container port `7070`.
 
 ## Step 6: Verify Deployment
 
