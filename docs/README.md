@@ -39,19 +39,24 @@ Start here to understand what Anemoi does and how to use it.
    - JSON telemetry endpoints
    - Docker/DNS access
 
-6. **[test_roadmap.md](test_roadmap.md)** (reference)
+6. **[RELEASE.md](RELEASE.md)** (10 min read)
+   - CI badges
+   - Tagged release workflow
+   - Source-build fallback
+
+7. **[test_roadmap.md](test_roadmap.md)** (reference)
    - Complete feature list
    - Test gates and requirements
    - All 28 prompts status (✅ 28/28 complete)
 
 ### Integration Guides
 
-7. **[Pi Integration Guide](../../.pi/ANEMOI_INTEGRATION.md)**
+8. **[Pi Integration Guide](../../.pi/ANEMOI_INTEGRATION.md)**
    - How to use Anemoi in Pi
    - Configuration details
    - Troubleshooting Pi issues
 
-8. **[OpenCode Integration Guide](../../source/repos/pantheon/.opencode/ANEMOI_INTEGRATION.md)**
+9. **[OpenCode Integration Guide](../../source/repos/pantheon/.opencode/ANEMOI_INTEGRATION.md)**
    - How to use Anemoi in OpenCode
    - Configuration details
    - Model selection

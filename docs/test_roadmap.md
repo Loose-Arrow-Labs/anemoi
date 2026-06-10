@@ -249,7 +249,7 @@ Prompt 14 passed with:
 - local binding defaults documented
 - optional JSONL decision log documented
 - `/execute` v1 limitation documented
-- legacy .NET surface marked `Needs validation`
+- repository surface documented as Rust-first
 - final validation passed
 
 Prompt 15 passed with:
