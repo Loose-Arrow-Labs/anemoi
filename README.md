@@ -13,6 +13,18 @@ Anemoi decides.
 Runtimes execute.
 ```
 
+## Dashboard
+
+A read-only operator view of every decision — what was selected, why, and what was
+rejected or staged instead:
+
+![Anemoi telemetry dashboard: a stage-background decision selecting the hot qwen9b worker, with its scored reasons (continuity, quality_stage), the rejected larger model (cold load exceeds the latency budget), live resident state, runtime health, and the live-execution gate chip](assets/dashboard-decision.png)
+
+The daemon serves this Vite/TypeScript dashboard at `/dashboard/` from read-only
+telemetry endpoints. See [docs/DASHBOARD.md](docs/DASHBOARD.md) to run it, and
+[reproduce this screenshot](docs/DASHBOARD.md#reproduce-this-screenshot) from
+fixture data (no live runtime required).
+
 ## Quick Start
 
 **For End Users (Pi / OpenCode)**:

@@ -65,6 +65,43 @@ For frontend-only fixture data, open:
 http://127.0.0.1:7070/dashboard/?fixture=1
 ```
 
+## Reproduce this screenshot
+
+The dashboard image in the project `README.md`
+([`assets/dashboard-decision.png`](../assets/dashboard-decision.png)) is captured
+from deterministic, fully synthetic **fixture** data — no live runtime, no private
+hostnames, tokens, or prompts. To recreate it:
+
+1. Build the dashboard once (the daemon serves the static `dist/`):
+
+   ```powershell
+   cd web/dashboard
+   npm install
+   npm run build
+   ```
+
+2. Start the daemon with the bundled mock config:
+
+   ```powershell
+   $env:ANEMOI_CONFIG = "config/anemoi.example.yaml"
+   $env:ANEMOI_BIND = "127.0.0.1:7070"
+   cargo run -p anemoi-daemon
+   ```
+
+3. Open the fixture view and click the single decision row (the `qwen9b` link in
+   the **Decisions** panel) so the **Decision Detail** panel shows its reasons and
+   rejected options:
+
+   ```text
+   http://127.0.0.1:7070/dashboard/?fixture=1
+   ```
+
+The fixture renders one `stage_background` decision: keep the hot `qwen9b` worker
+now, stage the larger `qwen35_a3b`, and reject a cold load that would exceed the
+interactive latency budget — the same data shown in the README image. Capture the
+viewport with any screenshot tool; the asset in the repo was rendered headless at
+2x device-pixel-ratio for crisp text.
+
 ## Docker/DNS Shape
 
 The Docker image copies the built dashboard assets into
