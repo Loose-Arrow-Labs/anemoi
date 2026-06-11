@@ -10,6 +10,9 @@ Runtimes execute.
 The v1 mock-config demo needs Rust and does not require Ollama, llama.cpp,
 llama-swap, SQLite, or a cloud provider.
 
+For beta caveats and surfaces that still need live validation, see
+[Known Limitations](LIMITATIONS.md).
+
 ## Local Prerequisites
 
 - Rust toolchain with `cargo`
@@ -95,7 +98,9 @@ rustup component add clippy
 
 ## Deferred
 
-- Full inference forwarding
 - Provider gateway behavior
 - Cloud execution
 - Database-backed analytics
+
+See [Known Limitations](LIMITATIONS.md) for implemented beta surfaces and
+pending public-readiness work.

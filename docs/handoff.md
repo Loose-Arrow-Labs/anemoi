@@ -12,7 +12,9 @@ explanation out
 optional JSONL log out
 ```
 
-No database is required. SQLite and database-backed analytics are deferred.
+No database is required. SQLite is optional and enabled with
+`ANEMOI_DATABASE_URL=sqlite://...`. Current caveats are centralized in
+[Known Limitations](LIMITATIONS.md).
 
 ## Validation
 
@@ -49,13 +51,4 @@ opening `http://127.0.0.1:7071/health` and `http://localhost:7071/health`.
 
 ## Needs Validation
 
-- llama-swap residency semantics: `/v1/models` is treated as configured model
-  metadata, not proof of resident/running models.
-- Full inference forwarding is intentionally not implemented in v1.
-- Live Ollama, llama-swap, and llama.cpp environments are not required for the
-  mock-config demo and need separate live validation when used.
-- `LlamaCppAdapter` (`llama_cpp` / `llama_server`) is implemented and
-  fixture-tested as an inspect-only adapter (`/health` + `/v1/models` →
-  `configured_models`, empty residents). Live validation against a real
-  `llama-server` is pending — see
-  `docs/live_validation/llama-cpp-probe.md`.
+See [Known Limitations](LIMITATIONS.md) for the current centralized list.

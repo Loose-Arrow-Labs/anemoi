@@ -2,6 +2,10 @@
 
 The Anemoi Inference Gateway (added in issue #34) provides an OpenAI-compatible endpoint that intelligently selects which model to use for each request.
 
+Gateway mock forwarding is operational. Live forwarding, quality-floor
+escalation, and DNS exposure have caveats; see
+[Known Limitations](LIMITATIONS.md).
+
 ## What is the Inference Gateway?
 
 Instead of:
