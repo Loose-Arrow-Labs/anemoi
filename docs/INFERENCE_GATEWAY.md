@@ -236,6 +236,40 @@ The gateway supports all standard OpenAI parameters:
 
 **Note**: Not all parameters are supported by all underlying runtimes. Unsupported parameters are silently ignored.
 
+### Anemoi Selection Metadata
+
+Clients can include a private `anemoi` object to describe scheduling needs. The
+gateway uses this metadata for the Anemoi decision and strips it before
+forwarding the request to the selected runtime.
+
+```json
+{
+  "model": "coding",
+  "messages": [{"role": "user", "content": "Plan this migration"}],
+  "max_tokens": 1024,
+  "anemoi": {
+    "quality_floor": { "minimum_parameter_class": "32b" },
+    "latency_budget_ms": 2000,
+    "escalation_intent": {
+      "task_type": "planning",
+      "context": "small model handled setup; escalate for architecture work"
+    }
+  }
+}
+```
+
+`quality_floor.minimum_parameter_class` is a hard floor for normal selection.
+For example, a `32b` request cannot be silently satisfied by a `9b` model. If a
+qualifying larger model exists but would cold-load beyond the latency budget,
+continuity policy may select a hot smaller worker immediately while staging the
+qualifying model in the background. If no qualifying model is configured for the
+domain, Anemoi denies the request instead of pretending the smaller model met
+the floor.
+
+Live background staging still respects the daemon safety gate:
+`ANEMOI_ENABLE_LIVE_EXECUTE=1` is required before Anemoi asks a runtime to load
+models.
+
 ---
 
 ## Response Telemetry

@@ -1,7 +1,11 @@
 # Anemoi
 
-**Status**: Beta. The mock path is operational; live runtime, Docker/DNS, and
-dashboard readiness are tracked in [Known Limitations](docs/LIMITATIONS.md).
+[![CI](https://github.com/Loose-Arrow-Labs/anemoi/actions/workflows/ci.yml/badge.svg)](https://github.com/Loose-Arrow-Labs/anemoi/actions/workflows/ci.yml)
+[![Release](https://github.com/Loose-Arrow-Labs/anemoi/actions/workflows/release.yml/badge.svg)](https://github.com/Loose-Arrow-Labs/anemoi/actions/workflows/release.yml)
+
+**Status**: Beta. CI is active and tagged release artifacts are prepared through
+the release workflow; live runtime, Docker/DNS, and dashboard readiness are
+tracked in [Known Limitations](docs/LIMITATIONS.md).
 
 Anemoi is a local-first inference governance layer for heterogeneous AI systems. It decides which model to use for each request based on resource constraints, latency budgets, and explicit policy scoring.
 
@@ -9,6 +13,18 @@ Anemoi is a local-first inference governance layer for heterogeneous AI systems.
 Anemoi decides.
 Runtimes execute.
 ```
+
+## Dashboard
+
+A read-only operator view of every decision — what was selected, why, and what was
+rejected or staged instead:
+
+![Anemoi telemetry dashboard: a stage-background decision selecting the hot qwen9b worker, with its scored reasons (continuity, quality_stage), the rejected larger model (cold load exceeds the latency budget), live resident state, runtime health, and the live-execution gate chip](assets/dashboard-decision.png)
+
+The daemon serves this Vite/TypeScript dashboard at `/dashboard/` from read-only
+telemetry endpoints. See [docs/DASHBOARD.md](docs/DASHBOARD.md) to run it, and
+[reproduce this screenshot](docs/DASHBOARD.md#reproduce-this-screenshot) from
+fixture data (no live runtime required).
 
 ## Quick Start
 
@@ -33,6 +49,18 @@ cargo run -p anemoi-cli -- status
 cargo run -p anemoi-cli -- decide --domain coding
 cargo run -p anemoi-cli -- explain <decision-id>
 ```
+
+## Beta Release Artifacts
+
+CI runs the Rust validation gates on every PR. Tagged beta releases are built by
+the release workflow and attach platform archives containing `anemoi` and
+`anemoi-daemon`. Until the first tag is cut, build from source with:
+
+```powershell
+cargo build --release -p anemoi-cli -p anemoi-daemon
+```
+
+See [docs/RELEASE.md](docs/RELEASE.md) for the release and install path.
 
 ---
 
@@ -389,6 +417,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 - **Gateway**: OpenAI-compatible inference endpoint active ✅
 - **Telemetry**: SQLite event store recording all decisions ✅
 - **Documentation**: Guides and examples complete ✅
+- **Repository Surface**: Rust workspace only; older parallel service files have been removed
 - **Known limitations**: see `docs/LIMITATIONS.md`
 - **Local-First**: By default, services bind to loopback (configurable via `anemoi.home.arpa`)
 
