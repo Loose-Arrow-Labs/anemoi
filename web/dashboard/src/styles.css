@@ -346,3 +346,148 @@ h3 {
     grid-template-columns: 1fr 1fr;
   }
 }
+
+/* ── governance / roster management (issue #138) ───────────────────────── */
+
+.tabs {
+  display: inline-flex;
+  gap: 4px;
+  margin-top: 8px;
+}
+
+.tab {
+  border: 1px solid #c9d1ca;
+  background: #ffffff;
+  color: #51605c;
+  border-radius: 6px;
+  padding: 5px 12px;
+  cursor: pointer;
+  font-size: 0.88rem;
+}
+
+.tab:hover {
+  border-color: #9db5b1;
+}
+
+.tab-active {
+  background: #006d75;
+  color: #ffffff;
+  border-color: #006d75;
+}
+
+.banner {
+  margin: 12px 0 0;
+  padding: 10px 14px;
+  border: 1px solid #adc5dc;
+  background: #e7f0f8;
+  color: #31516f;
+  border-radius: 6px;
+  font-size: 0.86rem;
+  overflow-wrap: anywhere;
+}
+
+.roster-create {
+  display: flex;
+  gap: 6px;
+  padding: 12px 14px;
+  border-bottom: 1px solid #dce2dc;
+}
+
+.roster-create input {
+  flex: 1;
+  min-width: 0;
+  border: 1px solid #c9d1ca;
+  border-radius: 6px;
+  padding: 6px 8px;
+}
+
+.roster-card,
+.domain-card {
+  border-top: 1px solid #eef1ee;
+  padding: 12px 14px;
+}
+
+.roster-card:first-of-type,
+.domain-card:first-of-type {
+  border-top: 0;
+}
+
+.roster-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.roster-flags,
+.domain-rosters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin: 8px 0;
+  color: #51605c;
+  font-size: 0.83rem;
+}
+
+.roster-flags label,
+.domain-rosters label {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.roster-models {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 6px 0;
+}
+
+.roster-models .chip {
+  gap: 4px;
+}
+
+.chip-x {
+  border: 0;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  font-size: 0.95rem;
+  line-height: 1;
+  padding: 0 0 0 4px;
+}
+
+.chip-x:hover {
+  color: #8d1d18;
+}
+
+.roster-add {
+  display: flex;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.roster-add select {
+  flex: 1;
+  min-width: 0;
+  border: 1px solid #c9d1ca;
+  border-radius: 6px;
+  padding: 5px;
+  background: #ffffff;
+}
+
+.roster-used {
+  margin-top: 6px;
+  color: #64726d;
+  font-size: 0.8rem;
+}
+
+.danger-link {
+  color: #8d1d18;
+  border-color: #e6aaa5;
+  background: #fdf1f0;
+}
+
+.catalog-note {
+  font-size: 0.8rem;
+}

@@ -148,6 +148,43 @@ type DashboardData = {
   actionPlans: ListResponse<ActionPlanEvent>;
 };
 
+// ── governance / roster management (issue #138) ─────────────────────────────
+
+type CatalogModel = {
+  model_id: string;
+  runtime_id: string;
+  source_adapter: string;
+  configured: boolean;
+  resident_state: string | null;
+  family: string;
+  parameter_class: string;
+  context_window: number | null;
+  supports_streaming: boolean | null;
+  metadata_source: string;
+  in_rosters: string[];
+};
+
+type RosterView = {
+  id: string;
+  purpose: string[];
+  models: string[];
+  keep_hot: boolean;
+  allow_background_load: boolean;
+  pinned: boolean;
+  model_count: number;
+  used_by_domains: string[];
+};
+
+type DomainView = { id: string; rosters: string[]; live_roster: string | null };
+type GovWarning = { code: string; target: string; detail: string };
+
+type GovernanceData = {
+  catalog: { models: CatalogModel[]; count: number; note: string };
+  rosters: { rosters: RosterView[]; count: number };
+  domains: { domains: DomainView[]; count: number };
+  validation: { ok: boolean; warnings: GovWarning[]; count: number };
+};
+
 const rootElement = document.querySelector<HTMLDivElement>("#anemoi-dashboard");
 if (!rootElement) {
   throw new Error("missing dashboard root");
@@ -157,6 +194,11 @@ const root: HTMLDivElement = rootElement;
 let selectedDecision: DecisionDetail | null = null;
 let lastUpdated = "";
 const useFixture = new URLSearchParams(window.location.search).get("fixture") === "1";
+
+type ViewMode = "telemetry" | "governance";
+let viewMode: ViewMode = "telemetry";
+let govData: GovernanceData | null = null;
+let govStatus = "";
 
 async function fetchJson<T>(path: string): Promise<T> {
   const response = await fetch(path, { headers: { accept: "application/json" } });
@@ -193,17 +235,11 @@ function render(data: DashboardData): void {
   lastUpdated = new Date().toLocaleTimeString();
   root.innerHTML = `
     <main class="shell">
-      <header class="topbar">
-        <div>
-          <h1>Anemoi</h1>
-          <p>Telemetry dashboard</p>
-        </div>
-        <div class="topbar-actions">
+      ${topbar(`
           ${chip(data.summary.live_execution_enabled ? "live execute on" : "dry-run gate", data.summary.live_execution_enabled ? "danger" : "neutral")}
           ${chip(data.summary.cache_populated ? "cache fresh" : "cache unknown", data.summary.cache_populated ? "ok" : "warn")}
           <span class="timestamp">Updated ${escapeHtml(lastUpdated)}</span>
-        </div>
-      </header>
+      `)}
 
       <section class="metrics" aria-label="Overview">
         ${metric("Runtimes", data.summary.runtime_count)}
@@ -273,6 +309,7 @@ function render(data: DashboardData): void {
       }
     });
   });
+  attachTabHandlers();
 }
 
 function renderRuntimes(items: RuntimeItem[]): string {
@@ -602,16 +639,413 @@ function fixtureDecisionDetail(id: string): DecisionDetail {
   };
 }
 
+function topbar(right: string): string {
+  return `
+      <header class="topbar">
+        <div>
+          <h1>Anemoi</h1>
+          <nav class="tabs">
+            <button class="tab ${viewMode === "telemetry" ? "tab-active" : ""}" data-view="telemetry">Telemetry</button>
+            <button class="tab ${viewMode === "governance" ? "tab-active" : ""}" data-view="governance">Governance</button>
+          </nav>
+        </div>
+        <div class="topbar-actions">${right}</div>
+      </header>`;
+}
+
+function attachTabHandlers(): void {
+  root.querySelectorAll<HTMLButtonElement>("[data-view]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const view = button.dataset.view as ViewMode | undefined;
+      if (view && view !== viewMode) {
+        viewMode = view;
+        govStatus = "";
+        void refresh();
+      }
+    });
+  });
+}
+
+async function loadGovernanceData(): Promise<GovernanceData> {
+  if (useFixture) {
+    return fixtureGovernance();
+  }
+  const [catalog, rosters, domains, validation] = await Promise.all([
+    fetchJson<GovernanceData["catalog"]>("/catalog/models"),
+    fetchJson<GovernanceData["rosters"]>("/rosters"),
+    fetchJson<GovernanceData["domains"]>("/domains"),
+    fetchJson<GovernanceData["validation"]>("/policy/validate"),
+  ]);
+  return { catalog, rosters, domains, validation };
+}
+
+// Issue one governance mutation, then reload the governance view. Edits are
+// disabled in the read-only fixture view.
+async function govMutate(method: string, path: string, body?: unknown): Promise<void> {
+  if (useFixture) {
+    govStatus = "Fixture view is read-only; run the daemon to edit governance.";
+    if (govData) {
+      renderGovernance(govData);
+    }
+    return;
+  }
+  try {
+    const response = await fetch(path, {
+      method,
+      headers: { "content-type": "application/json", accept: "application/json" },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    if (!response.ok) {
+      const detail = (await response.json().catch(() => ({}))) as { error?: string };
+      govStatus = `${method} ${path} → ${response.status}: ${detail.error ?? "error"}`;
+    } else {
+      govStatus = `${method} ${path} → ok`;
+    }
+  } catch (error) {
+    govStatus = `${method} ${path} failed: ${String(error)}`;
+  }
+  // Reload through refresh(): it owns load-and-render error handling (error
+  // panel on failure) and never throws, so `void govMutate(...)` callers can
+  // never produce an unhandled rejection.
+  await refresh();
+}
+
+function renderGovernance(gov: GovernanceData): void {
+  lastUpdated = new Date().toLocaleTimeString();
+  root.innerHTML = `
+    <main class="shell">
+      ${topbar(`
+        ${chip(gov.validation.ok ? "policy ok" : `${gov.validation.count} warning${gov.validation.count === 1 ? "" : "s"}`, gov.validation.ok ? "ok" : "warn")}
+        <span class="timestamp">Updated ${escapeHtml(lastUpdated)}</span>
+      `)}
+
+      ${govStatus ? `<p class="banner">${escapeHtml(govStatus)}</p>` : ""}
+
+      <section class="metrics" aria-label="Governance overview">
+        ${metric("Catalog models", gov.catalog.count)}
+        ${metric("Rosters", gov.rosters.count)}
+        ${metric("Domains", gov.domains.count)}
+        ${metric("Warnings", gov.validation.count)}
+      </section>
+
+      <div class="layout">
+        <section class="panel validation">
+          <div class="panel-header"><h2>Validation</h2><span>${gov.validation.count} warnings</span></div>
+          ${renderWarnings(gov.validation.warnings)}
+        </section>
+
+        <section class="panel domains">
+          <div class="panel-header"><h2>Domains</h2><span>${gov.domains.count}</span></div>
+          ${renderDomains(gov.domains.domains, gov.rosters.rosters)}
+        </section>
+
+        <section class="panel rosters">
+          <div class="panel-header"><h2>Rosters</h2><span>${gov.rosters.count}</span></div>
+          ${renderRosterEditors(gov.rosters.rosters, gov.catalog.models)}
+        </section>
+
+        <section class="panel catalog">
+          <div class="panel-header"><h2>Model Catalog</h2><span>${gov.catalog.count}</span></div>
+          ${renderCatalog(gov.catalog.models)}
+        </section>
+      </div>
+      <p class="empty catalog-note">${escapeHtml(gov.catalog.note)}</p>
+    </main>
+  `;
+  attachTabHandlers();
+  attachGovernanceHandlers();
+}
+
+function renderWarnings(warnings: GovWarning[]): string {
+  if (warnings.length === 0) {
+    return emptyState("No governance warnings. Every domain can produce candidates.");
+  }
+  return `<ul class="event-list">${warnings
+    .map(
+      (warning) =>
+        `<li><b>${escapeHtml(formatChipLabel(warning.code))}</b> <span>${escapeHtml(warning.target)}</span> ${escapeHtml(warning.detail)}</li>`
+    )
+    .join("")}</ul>`;
+}
+
+function renderCatalog(models: CatalogModel[]): string {
+  if (models.length === 0) {
+    return emptyState("No models discovered from runtime catalogs yet.");
+  }
+  return table(
+    ["Model", "Runtime", "Source", "Residency", "Class", "Metadata", "In rosters"],
+    models.map((model) => [
+      escapeHtml(model.model_id),
+      escapeHtml(model.runtime_id),
+      escapeHtml(model.source_adapter),
+      model.resident_state
+        ? chip(model.resident_state, stateTone(model.resident_state))
+        : chip("configured only", "neutral"),
+      escapeHtml(model.parameter_class),
+      chip(model.metadata_source, model.metadata_source === "operator_override" ? "ok" : "neutral"),
+      model.in_rosters.length ? escapeHtml(model.in_rosters.join(", ")) : "—",
+    ])
+  );
+}
+
+function renderRosterEditors(rosters: RosterView[], catalog: CatalogModel[]): string {
+  const options = catalog
+    .map((model) => `<option value="${escapeHtml(model.model_id)}">${escapeHtml(model.model_id)}</option>`)
+    .join("");
+  const cards = rosters
+    .map(
+      (roster) => `
+      <div class="roster-card">
+        <div class="roster-head">
+          <strong>${escapeHtml(roster.id)}</strong>
+          <button class="link-button danger-link" data-action="delete-roster" data-roster="${escapeHtml(roster.id)}">delete</button>
+        </div>
+        <div class="roster-flags">
+          <label><input type="checkbox" data-action="flag" data-flag="keep_hot" data-roster="${escapeHtml(roster.id)}" ${roster.keep_hot ? "checked" : ""}/> keep hot</label>
+          <label><input type="checkbox" data-action="flag" data-flag="allow_background_load" data-roster="${escapeHtml(roster.id)}" ${roster.allow_background_load ? "checked" : ""}/> bg load</label>
+          <label><input type="checkbox" data-action="flag" data-flag="pinned" data-roster="${escapeHtml(roster.id)}" ${roster.pinned ? "checked" : ""}/> pinned</label>
+        </div>
+        <div class="roster-models">
+          ${
+            roster.models.length
+              ? roster.models
+                  .map(
+                    (model) =>
+                      `<span class="chip chip-neutral">${escapeHtml(model)}<button class="chip-x" data-action="remove-model" data-roster="${escapeHtml(roster.id)}" data-model="${escapeHtml(model)}" title="remove">×</button></span>`
+                  )
+                  .join("")
+              : '<span class="empty">empty roster</span>'
+          }
+        </div>
+        <div class="roster-add">
+          <select data-role="add-model-select" data-roster="${escapeHtml(roster.id)}"><option value="">add model…</option>${options}</select>
+          <button class="link-button" data-action="add-model" data-roster="${escapeHtml(roster.id)}">add</button>
+        </div>
+        <div class="roster-used">used by: ${roster.used_by_domains.length ? escapeHtml(roster.used_by_domains.join(", ")) : "no domains"}</div>
+      </div>`
+    )
+    .join("");
+  return `
+    <div class="roster-create">
+      <input type="text" data-role="new-roster-id" placeholder="new-roster-id"/>
+      <button class="link-button" data-action="create-roster">create roster</button>
+    </div>
+    ${cards || emptyState("No rosters yet.")}
+  `;
+}
+
+function renderDomains(domains: DomainView[], rosters: RosterView[]): string {
+  if (domains.length === 0) {
+    return emptyState("No domains configured.");
+  }
+  return domains
+    .map((domain) => {
+      if (domain.live_roster) {
+        return `<div class="domain-card"><strong>${escapeHtml(domain.id)}</strong> ${chip(`live: ${domain.live_roster}`, "neutral")}</div>`;
+      }
+      const checks = rosters
+        .map(
+          (roster) =>
+            `<label><input type="checkbox" data-role="domain-roster" data-domain="${escapeHtml(domain.id)}" value="${escapeHtml(roster.id)}" ${domain.rosters.includes(roster.id) ? "checked" : ""}/> ${escapeHtml(roster.id)}</label>`
+        )
+        .join("");
+      return `
+      <div class="domain-card">
+        <strong>${escapeHtml(domain.id)}</strong>
+        <div class="domain-rosters">${checks || '<span class="empty">no rosters defined</span>'}</div>
+        <button class="link-button" data-action="assign-domain" data-domain="${escapeHtml(domain.id)}">apply rosters</button>
+      </div>`;
+    })
+    .join("");
+}
+
+function attachGovernanceHandlers(): void {
+  const all = <T extends Element>(query: string): T[] => Array.from(root.querySelectorAll<T>(query));
+
+  all<HTMLButtonElement>('[data-action="create-roster"]').forEach((button) =>
+    button.addEventListener("click", () => {
+      const input = root.querySelector<HTMLInputElement>('[data-role="new-roster-id"]');
+      const id = input?.value.trim();
+      if (id) {
+        void govMutate("POST", "/rosters", { id });
+      }
+    })
+  );
+  all<HTMLButtonElement>('[data-action="delete-roster"]').forEach((button) =>
+    button.addEventListener("click", () => {
+      const id = button.dataset.roster;
+      if (id && window.confirm(`Delete roster ${id}?`)) {
+        void govMutate("DELETE", `/rosters/${encodeURIComponent(id)}`);
+      }
+    })
+  );
+  all<HTMLButtonElement>('[data-action="add-model"]').forEach((button) =>
+    button.addEventListener("click", () => {
+      const id = button.dataset.roster ?? "";
+      const select = root.querySelector<HTMLSelectElement>(
+        `[data-role="add-model-select"][data-roster="${cssAttr(id)}"]`
+      );
+      const model = select?.value;
+      if (id && model) {
+        void govMutate("POST", `/rosters/${encodeURIComponent(id)}/models`, { model_id: model });
+      }
+    })
+  );
+  all<HTMLButtonElement>('[data-action="remove-model"]').forEach((button) =>
+    button.addEventListener("click", () => {
+      const id = button.dataset.roster ?? "";
+      const model = button.dataset.model ?? "";
+      if (id && model) {
+        void govMutate(
+          "DELETE",
+          `/rosters/${encodeURIComponent(id)}/models/${encodeURIComponent(model)}`
+        );
+      }
+    })
+  );
+  all<HTMLInputElement>('[data-action="flag"]').forEach((input) =>
+    input.addEventListener("change", () => {
+      const id = input.dataset.roster ?? "";
+      const flag = input.dataset.flag ?? "";
+      if (id && flag) {
+        void govMutate("PATCH", `/rosters/${encodeURIComponent(id)}`, { [flag]: input.checked });
+      }
+    })
+  );
+  all<HTMLButtonElement>('[data-action="assign-domain"]').forEach((button) =>
+    button.addEventListener("click", () => {
+      const domain = button.dataset.domain ?? "";
+      const selected = all<HTMLInputElement>(
+        `[data-role="domain-roster"][data-domain="${cssAttr(domain)}"]`
+      )
+        .filter((checkbox) => checkbox.checked)
+        .map((checkbox) => checkbox.value);
+      if (domain) {
+        void govMutate("PATCH", `/domains/${encodeURIComponent(domain)}/rosters`, { rosters: selected });
+      }
+    })
+  );
+}
+
+// Escape a value for safe use inside a `[attr="..."]` CSS selector.
+function cssAttr(value: string): string {
+  return value.replace(/["\\]/g, "\\$&");
+}
+
+function fixtureGovernance(): GovernanceData {
+  return {
+    catalog: {
+      models: [
+        {
+          model_id: "qwen9b",
+          runtime_id: "llama_swap",
+          source_adapter: "llama_swap",
+          configured: true,
+          resident_state: "hot_gpu",
+          family: "qwen",
+          parameter_class: "9b",
+          context_window: 32768,
+          supports_streaming: true,
+          metadata_source: "config",
+          in_rosters: ["fast"],
+        },
+        {
+          model_id: "qwen35b",
+          runtime_id: "llama_swap",
+          source_adapter: "llama_swap",
+          configured: true,
+          resident_state: null,
+          family: "qwen",
+          parameter_class: "35b",
+          context_window: 32768,
+          supports_streaming: true,
+          metadata_source: "config",
+          in_rosters: ["big"],
+        },
+        {
+          model_id: "gemma-4-31b-it",
+          runtime_id: "llama_swap",
+          source_adapter: "llama_swap",
+          configured: true,
+          resident_state: null,
+          family: "gemma",
+          parameter_class: "27b",
+          context_window: 262144,
+          supports_streaming: true,
+          metadata_source: "operator_override",
+          in_rosters: [],
+        },
+      ],
+      count: 3,
+      note: "Catalog/configured models are discovered from runtime catalogs and are NOT residency evidence. resident_state is set only when a model is separately observed loaded.",
+    },
+    rosters: {
+      rosters: [
+        {
+          id: "fast",
+          purpose: ["coding", "interactive"],
+          models: ["qwen9b"],
+          keep_hot: true,
+          allow_background_load: true,
+          pinned: false,
+          model_count: 1,
+          used_by_domains: ["coding"],
+        },
+        {
+          id: "big",
+          purpose: ["escalation"],
+          models: ["qwen35b"],
+          keep_hot: false,
+          allow_background_load: true,
+          pinned: false,
+          model_count: 1,
+          used_by_domains: [],
+        },
+      ],
+      count: 2,
+    },
+    domains: {
+      domains: [
+        { id: "coding", rosters: ["fast"], live_roster: null },
+        { id: "coding-full", rosters: [], live_roster: "llama_swap" },
+      ],
+      count: 2,
+    },
+    validation: {
+      ok: false,
+      warnings: [
+        {
+          code: "domain.no_escalation",
+          target: "coding",
+          detail:
+            "domain coding cannot escalate beyond 9B: its largest roster model is 9B; add a larger model to enable escalation",
+        },
+      ],
+      count: 1,
+    },
+  };
+}
+
 async function refresh(): Promise<void> {
   try {
-    const data = await loadDashboardData();
-    render(data);
+    if (viewMode === "governance") {
+      govData = await loadGovernanceData();
+      renderGovernance(govData);
+    } else {
+      const data = await loadDashboardData();
+      render(data);
+    }
   } catch (error) {
-    root.innerHTML = `<main class="shell"><section class="panel error"><h1>Anemoi</h1><p>${escapeHtml(String(error))}</p></section></main>`;
+    root.innerHTML = `<main class="shell">${topbar("")}<section class="panel error"><p>${escapeHtml(String(error))}</p></section></main>`;
+    attachTabHandlers();
   }
 }
 
 void refresh();
 window.setInterval(() => {
-  void refresh();
+  // Auto-refresh telemetry only. The governance view holds checkbox/select form
+  // state and refreshes explicitly after each edit, so a 5s clobber is avoided.
+  if (viewMode === "telemetry") {
+    void refresh();
+  }
 }, 5000);

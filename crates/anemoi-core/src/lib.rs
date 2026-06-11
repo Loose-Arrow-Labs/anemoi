@@ -5,6 +5,13 @@ use std::fmt::{Display, Formatter};
 use std::sync::LazyLock;
 use uuid::Uuid;
 
+pub mod governance;
+pub use governance::{
+    apply_overrides, infer_family_and_class, merge_profile, parameter_billions,
+    validate_governance, GovernanceOverrides, GovernanceWarning, MetadataSource,
+    ModelProfileOverride, RosterOverride, ESCALATION_FLOOR_BILLIONS,
+};
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct RequestId(pub String);
@@ -29,7 +36,7 @@ impl Display for RequestId {
 
 macro_rules! id_type {
     ($name:ident) => {
-        #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+        #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
         #[serde(transparent)]
         pub struct $name(pub String);
 
