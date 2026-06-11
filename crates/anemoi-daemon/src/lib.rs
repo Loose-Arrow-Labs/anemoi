@@ -8,9 +8,12 @@ use anemoi_runtime::{
     DynRuntimeAdapter, ForwardedChatCompletion, LlamaCppAdapter, LlamaSwapAdapter,
     LlamaSwapEventStream, MockRuntimeAdapter, OllamaAdapter,
 };
-use anemoi_telemetry::{DynDecisionLog, InMemoryDecisionLog, ResidentTransitionRecord};
+use anemoi_telemetry::{
+    ActionPlanEvent, DynDecisionLog, InMemoryDecisionLog, ResidentEvent, ResidentTransitionRecord,
+    RuntimeSnapshotEvent, StagingEvent,
+};
 use axum::body::Body;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -19,9 +22,11 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, PoisonError, RwLock as StdRwLock};
 use tokio::sync::RwLock;
+use tower_http::services::ServeDir;
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
@@ -482,7 +487,7 @@ impl StagingWorker {
         reason: String,
         pending_context: Option<String>,
         runnable: bool,
-    ) {
+    ) -> StagingIntent {
         let mut intent = StagingIntent::new(
             decision_id,
             foreground_model,
@@ -502,7 +507,9 @@ impl StagingWorker {
                     .to_string(),
             );
         }
+        let recorded = intent.clone();
         self.enqueue(intent).await;
+        recorded
     }
 
     /// On the eviction signal (issue #64): for each `Pending` intent whose
@@ -1088,7 +1095,7 @@ impl AppState {
             staging,
             recent_decision_count,
             policy_warnings,
-            live_execution_enabled: live_execution_enabled(),
+            live_execution_enabled: self.live_execute_enabled(),
         }
     }
 
@@ -1119,7 +1126,8 @@ impl AppState {
                 // reported as Blocked rather than queued ready-to-run.
                 let is_mock = self.runtime_adapter_type(&runtime_id.0) == Some("mock");
                 let runnable = is_mock || self.live_execute_enabled();
-                self.staging_worker
+                let intent = self
+                    .staging_worker
                     .queue_intent(
                         decision.id,
                         decision.selected_model.clone(),
@@ -1130,6 +1138,16 @@ impl AppState {
                         runnable,
                     )
                     .await;
+                self.decision_log
+                    .record_staging_status(
+                        intent.id,
+                        intent.decision_id,
+                        &intent.background_model.0,
+                        &intent.target_runtime.0,
+                        &intent.reason,
+                        &staging_state_str(&intent.state),
+                    )
+                    .await?;
             }
         }
 
@@ -1327,6 +1345,16 @@ impl AppState {
                         round,
                     )
                     .await;
+                    let observed_at = Utc::now();
+                    let _ = self
+                        .decision_log
+                        .record_runtime_snapshot_event(
+                            Uuid::new_v4(),
+                            runtime_id,
+                            &snapshot,
+                            observed_at,
+                        )
+                        .await;
                     self.reconciler.update(runtime_id, snapshot).await;
                 }
                 Err(e) => {
@@ -1496,8 +1524,9 @@ fn live_execution_enabled() -> bool {
 mod tests {
     use super::*;
     use anemoi_core::{
-        DecisionAction, DomainId, EscalationIntent, ExecutionMode, ModelId, ModelProfileConfig,
-        ModelResident, RequestId, ResidencyState, RuntimeConfig, RuntimeId,
+        DecisionAction, DecisionReason, DecisionScore, DomainId, EscalationIntent, ExecutionMode,
+        Explanation, ModelId, ModelProfileConfig, ModelResident, RejectedOption, RequestId,
+        ResidencyGroupId, ResidencyState, RuntimeConfig, RuntimeId, ScoreContribution,
     };
     use anemoi_telemetry::{decision_log_from, DecisionLog, InMemoryDecisionLog, SqliteEventStore};
     use axum::body::{to_bytes, Body};
@@ -1627,6 +1656,321 @@ mod tests {
         assert_eq!(snapshots.len(), 1);
         assert_eq!(snapshots[0].runtime_id.to_string(), "mock");
         assert_eq!(snapshots[0].residents.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn telemetry_summary_returns_exact_json_shape() {
+        let state = AppState::new(example_config(), Arc::new(InMemoryDecisionLog::default()))
+            .expect("state");
+        state.run_reconciliation_tick().await;
+
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/telemetry/summary")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let body = json_body(response).await;
+
+        assert_eq!(body["cache_populated"], true);
+        assert_eq!(body["runtime_count"], 1);
+        assert_eq!(body["resident_count"], 1);
+        assert_eq!(body["unavailable_runtime_count"], 0);
+        assert_eq!(body["stale_runtime_count"], 0);
+        assert_eq!(body["active_request_count"], 0);
+        assert_eq!(body["staging"]["total"], 0);
+        assert_eq!(body["recent_decision_count"], 0);
+        assert_eq!(body["policy_warnings"], serde_json::json!([]));
+        assert_eq!(body["live_execution_enabled"], false);
+    }
+
+    #[tokio::test]
+    async fn telemetry_summary_includes_live_execution_gate_state() {
+        let state = AppState::new(example_config(), Arc::new(InMemoryDecisionLog::default()))
+            .expect("state")
+            .with_live_execute(true);
+
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/telemetry/summary")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let body = json_body(response).await;
+
+        assert_eq!(body["live_execution_enabled"], true);
+    }
+
+    #[tokio::test]
+    async fn telemetry_decisions_lists_selected_model_runtime_action() {
+        let app = test_router();
+        let decide_response = app
+            .clone()
+            .oneshot(json_request("/decide", &sample_request()))
+            .await
+            .expect("decide response");
+        let decision: Decision =
+            serde_json::from_value(json_body(decide_response).await).expect("decision");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/telemetry/decisions?limit=10")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let body = json_body(response).await;
+
+        assert_eq!(body["count"], 1);
+        assert_eq!(body["limit"], 10);
+        assert_eq!(body["items"][0]["id"], decision.id.to_string());
+        assert_eq!(
+            body["items"][0]["selected_model"],
+            decision
+                .selected_model
+                .as_ref()
+                .map(ToString::to_string)
+                .expect("selected model")
+        );
+        assert_eq!(
+            body["items"][0]["selected_runtime"],
+            decision
+                .selected_runtime
+                .as_ref()
+                .map(ToString::to_string)
+                .expect("selected runtime")
+        );
+        assert_eq!(
+            body["items"][0]["action"],
+            serde_json::json!(decision.action)
+        );
+        assert!(body["items"][0]["score"]["contributions"].is_array());
+    }
+
+    #[tokio::test]
+    async fn telemetry_decision_returns_explanation_and_rejected_options() {
+        let log = Arc::new(InMemoryDecisionLog::default());
+        let state = AppState::new(example_config(), log.clone()).expect("state");
+        let decision = Decision {
+            id: Uuid::new_v4(),
+            request_id: RequestId::new(),
+            action: DecisionAction::ReuseHot,
+            selected_model: Some(ModelId("qwen9b".to_string())),
+            selected_runtime: Some(RuntimeId("mock".to_string())),
+            selected_group: Some(ResidencyGroupId("small_swarm".to_string())),
+            background_model: None,
+            score: DecisionScore {
+                total: 42,
+                contributions: vec![ScoreContribution {
+                    label: "hot resident".to_string(),
+                    value: 42,
+                }],
+            },
+            explanation: Explanation {
+                summary: "Selected hot worker.".to_string(),
+                reasons: vec![DecisionReason {
+                    code: "hot_resident".to_string(),
+                    detail: "qwen9b is already hot on mock".to_string(),
+                    impact: 42,
+                }],
+                rejected_options: vec![RejectedOption {
+                    model_id: Some(ModelId("qwen35_a3b".to_string())),
+                    runtime_id: Some(RuntimeId("mock".to_string())),
+                    reason: "cold load exceeds latency budget".to_string(),
+                }],
+            },
+            created_at: Utc::now(),
+        };
+        log.record_decision(&decision).await.expect("record");
+
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/telemetry/decision/{}", decision.id))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let body = json_body(response).await;
+
+        assert_eq!(body["id"], decision.id.to_string());
+        assert_eq!(body["explanation"]["summary"], "Selected hot worker.");
+        assert_eq!(body["explanation"]["reasons"][0]["code"], "hot_resident");
+        assert_eq!(
+            body["explanation"]["rejected_options"][0]["reason"],
+            "cold load exceeds latency budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn telemetry_staging_events_surface_skip_reasons() {
+        let state = stage_background_state_on_live_runtime(false);
+        let decision = state.decide(&sample_request()).await.expect("decision");
+
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/telemetry/staging-events?limit=5")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let body = json_body(response).await;
+
+        assert_eq!(body["count"], 1);
+        assert_eq!(body["items"][0]["decision_id"], decision.id.to_string());
+        assert_eq!(body["items"][0]["state"], "blocked");
+        assert!(body["items"][0]["last_error"]
+            .as_str()
+            .expect("last_error")
+            .contains("ANEMOI_ENABLE_LIVE_EXECUTE"));
+    }
+
+    #[tokio::test]
+    async fn telemetry_endpoints_work_without_sqlite() {
+        let response = test_router()
+            .oneshot(
+                Request::builder()
+                    .uri("/telemetry/resident-events?limit=10")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let body = json_body(response).await;
+
+        assert_eq!(body["count"], 0);
+        assert_eq!(body["items"], serde_json::json!([]));
+        assert_eq!(body["limit"], 10);
+    }
+
+    #[tokio::test]
+    async fn telemetry_reads_sqlite_resident_event_history() {
+        let db_path = std::env::temp_dir().join(format!("anemoi-test-{}.db", Uuid::new_v4()));
+        let store = Arc::new(SqliteEventStore::create(&db_path).expect("sqlite store"));
+        let state = AppState::new(example_config(), store).expect("state");
+
+        state.run_reconciliation_tick().await;
+
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/telemetry/resident-events?model_id=qwen9b&limit=10")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let body = json_body(response).await;
+
+        assert_eq!(body["count"], 1);
+        assert_eq!(body["items"][0]["model_id"], "qwen9b");
+        assert_eq!(body["items"][0]["runtime_id"], "mock");
+        assert_eq!(body["items"][0]["from_state"], "cold");
+        assert_eq!(body["items"][0]["to_state"], "hot_gpu");
+        assert!(body["items"][0]["evidence_source"]
+            .as_str()
+            .expect("evidence source")
+            .contains("reconciliation round"));
+
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[tokio::test]
+    async fn telemetry_runtime_snapshots_include_current_and_sqlite_history() {
+        let db_path = std::env::temp_dir().join(format!("anemoi-test-{}.db", Uuid::new_v4()));
+        let store = Arc::new(SqliteEventStore::create(&db_path).expect("sqlite store"));
+        let state = AppState::new(example_config(), store).expect("state");
+
+        state.run_reconciliation_tick().await;
+
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/telemetry/runtime-snapshots?runtime_id=mock&limit=10")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let body = json_body(response).await;
+
+        assert_eq!(body["cache_populated"], true);
+        assert_eq!(body["count"], 1);
+        assert_eq!(body["items"][0]["runtime_id"], "mock");
+        assert_eq!(body["items"][0]["resident_count"], 1);
+        assert_eq!(body["history_count"], 1);
+        assert_eq!(body["history"][0]["runtime_id"], "mock");
+
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[tokio::test]
+    async fn telemetry_action_plans_read_sqlite_history() {
+        let db_path = std::env::temp_dir().join(format!("anemoi-test-{}.db", Uuid::new_v4()));
+        let store = Arc::new(SqliteEventStore::create(&db_path).expect("sqlite store"));
+        let state = AppState::new(example_config(), store).expect("state");
+        let app = router(state);
+
+        let execute_response = app
+            .clone()
+            .oneshot(json_request("/execute", &sample_request()))
+            .await
+            .expect("execute response");
+        let execute: ExecuteResponse =
+            serde_json::from_value(json_body(execute_response).await).expect("execute");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/telemetry/action-plans?decision_id={}&limit=10",
+                        execute.decision.id
+                    ))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let body = json_body(response).await;
+
+        assert_eq!(body["count"], 1);
+        assert_eq!(
+            body["items"][0]["plan"]["decision_id"],
+            execute.decision.id.to_string()
+        );
+        assert_eq!(body["items"][0]["plan"]["dry_run"], true);
+
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[tokio::test]
+    async fn dashboard_serves_index_html() {
+        let response = test_router()
+            .oneshot(
+                Request::builder()
+                    .uri("/dashboard/")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let status = response.status();
+        let html = body_text(response).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(html.contains("anemoi-dashboard"));
+        assert!(html.contains("module"));
     }
 
     #[tokio::test]
@@ -4244,10 +4588,21 @@ continuity:
 }
 
 pub fn router(state: AppState) -> Router {
+    let dashboard_assets = dashboard_dist_dir();
     Router::new()
         .route("/health", get(health))
         .route("/status", get(status))
         .route("/residents", get(residents))
+        .route("/telemetry/summary", get(telemetry_summary))
+        .route("/telemetry/decisions", get(telemetry_decisions))
+        .route("/telemetry/decision/:id", get(telemetry_decision))
+        .route("/telemetry/resident-events", get(telemetry_resident_events))
+        .route("/telemetry/staging-events", get(telemetry_staging_events))
+        .route("/telemetry/action-plans", get(telemetry_action_plans))
+        .route(
+            "/telemetry/runtime-snapshots",
+            get(telemetry_runtime_snapshots),
+        )
         .route("/decide", post(decide))
         .route("/execute", post(execute))
         .route("/decisions/:id", get(decision))
@@ -4256,6 +4611,10 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/openapi.json", get(openapi))
+        .nest_service(
+            "/dashboard",
+            ServeDir::new(dashboard_assets).append_index_html_on_directories(true),
+        )
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
@@ -4290,6 +4649,155 @@ pub async fn serve(addr: SocketAddr, state: AppState) -> anyhow::Result<()> {
 #[derive(Serialize)]
 struct HealthResponse {
     ok: bool,
+}
+
+const DEFAULT_TELEMETRY_LIMIT: usize = 50;
+const MAX_TELEMETRY_LIMIT: usize = 500;
+
+#[derive(Debug, Deserialize)]
+struct TelemetryLimitQuery {
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResidentEventsQuery {
+    model_id: Option<String>,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ActionPlansQuery {
+    decision_id: Option<String>,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RuntimeSnapshotsQuery {
+    runtime_id: Option<String>,
+    limit: Option<usize>,
+}
+
+#[derive(Serialize)]
+struct TelemetryList<T> {
+    items: Vec<T>,
+    count: usize,
+    limit: usize,
+}
+
+#[derive(Serialize)]
+struct TelemetrySummary {
+    cache_populated: bool,
+    runtime_count: usize,
+    resident_count: usize,
+    unavailable_runtime_count: usize,
+    stale_runtime_count: usize,
+    active_request_count: usize,
+    staging: StagingSummary,
+    recent_decision_count: usize,
+    policy_warnings: Vec<String>,
+    live_execution_enabled: bool,
+}
+
+#[derive(Serialize)]
+struct TelemetryDecisionSummary {
+    id: Uuid,
+    request_id: String,
+    action: DecisionAction,
+    selected_model: Option<String>,
+    selected_runtime: Option<String>,
+    selected_group: Option<String>,
+    background_model: Option<String>,
+    score: anemoi_core::DecisionScore,
+    explanation_summary: String,
+    reason_count: usize,
+    rejected_option_count: usize,
+    created_at: DateTime<Utc>,
+}
+
+impl From<&Decision> for TelemetryDecisionSummary {
+    fn from(decision: &Decision) -> Self {
+        Self {
+            id: decision.id,
+            request_id: decision.request_id.to_string(),
+            action: decision.action.clone(),
+            selected_model: decision.selected_model.as_ref().map(ToString::to_string),
+            selected_runtime: decision.selected_runtime.as_ref().map(ToString::to_string),
+            selected_group: decision.selected_group.as_ref().map(ToString::to_string),
+            background_model: decision.background_model.as_ref().map(ToString::to_string),
+            score: decision.score.clone(),
+            explanation_summary: decision.explanation.summary.clone(),
+            reason_count: decision.explanation.reasons.len(),
+            rejected_option_count: decision.explanation.rejected_options.len(),
+            created_at: decision.created_at,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct TelemetryStagingEvents {
+    items: Vec<StagingIntent>,
+    history: Vec<StagingEvent>,
+    count: usize,
+    history_count: usize,
+    limit: usize,
+}
+
+#[derive(Serialize)]
+struct TelemetryRuntimeSnapshots {
+    items: Vec<TelemetryRuntimeSnapshot>,
+    history: Vec<RuntimeSnapshotEvent>,
+    cache_populated: bool,
+    count: usize,
+    history_count: usize,
+    limit: usize,
+}
+
+#[derive(Serialize)]
+struct TelemetryRuntimeSnapshot {
+    runtime_id: String,
+    availability: String,
+    freshness: String,
+    last_inspected: DateTime<Utc>,
+    last_error: Option<String>,
+    resident_count: usize,
+    active_request_count: usize,
+    configured_model_count: usize,
+    snapshot: RuntimeSnapshot,
+}
+
+fn telemetry_limit(limit: Option<usize>) -> usize {
+    limit
+        .unwrap_or(DEFAULT_TELEMETRY_LIMIT)
+        .clamp(1, MAX_TELEMETRY_LIMIT)
+}
+
+fn dashboard_dist_dir() -> PathBuf {
+    if let Some(path) = std::env::var_os("ANEMOI_DASHBOARD_DIST") {
+        return PathBuf::from(path);
+    }
+
+    let cwd_path = std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join("web")
+        .join("dashboard")
+        .join("dist");
+    if cwd_path.exists() {
+        return cwd_path;
+    }
+
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("web")
+        .join("dashboard")
+        .join("dist")
+}
+
+fn staging_state_str(state: &StagingState) -> String {
+    serde_json::to_value(state)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_default()
 }
 
 async fn health() -> Json<HealthResponse> {
@@ -4350,6 +4858,108 @@ pub fn openapi_document() -> serde_json::Value {
                                     }
                                 }
                             }
+                        }
+                    }
+                }
+            },
+            "/telemetry/summary": {
+                "get": {
+                    "responses": {
+                        "200": {
+                            "description": "Read-only dashboard summary: runtime, resident, staging, decision, and live-execute gate counts.",
+                            "content": { "application/json": { "schema": { "type": "object" } } }
+                        }
+                    }
+                }
+            },
+            "/telemetry/decisions": {
+                "get": {
+                    "parameters": [{ "$ref": "#/components/parameters/Limit" }],
+                    "responses": {
+                        "200": {
+                            "description": "Recent decision summaries with selected model/runtime/action and score contributions.",
+                            "content": { "application/json": { "schema": { "type": "object" } } }
+                        }
+                    }
+                }
+            },
+            "/telemetry/decision/{id}": {
+                "get": {
+                    "parameters": [{ "$ref": "#/components/parameters/DecisionId" }],
+                    "responses": {
+                        "200": {
+                            "description": "Recorded decision including full explanation and rejected options.",
+                            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Decision" } } }
+                        },
+                        "404": { "$ref": "#/components/responses/Error" }
+                    }
+                }
+            },
+            "/telemetry/resident-events": {
+                "get": {
+                    "parameters": [
+                        { "$ref": "#/components/parameters/Limit" },
+                        {
+                            "name": "model_id",
+                            "in": "query",
+                            "required": false,
+                            "schema": { "type": "string" }
+                        }
+                    ],
+                    "responses": {
+                        "200": {
+                            "description": "Resident transition history when a durable event store is configured.",
+                            "content": { "application/json": { "schema": { "type": "object" } } }
+                        }
+                    }
+                }
+            },
+            "/telemetry/staging-events": {
+                "get": {
+                    "parameters": [{ "$ref": "#/components/parameters/Limit" }],
+                    "responses": {
+                        "200": {
+                            "description": "Current staging intents, skip reasons, and durable staging history when available.",
+                            "content": { "application/json": { "schema": { "type": "object" } } }
+                        }
+                    }
+                }
+            },
+            "/telemetry/action-plans": {
+                "get": {
+                    "parameters": [
+                        { "$ref": "#/components/parameters/Limit" },
+                        {
+                            "name": "decision_id",
+                            "in": "query",
+                            "required": false,
+                            "schema": { "type": "string", "format": "uuid" }
+                        }
+                    ],
+                    "responses": {
+                        "200": {
+                            "description": "Durable action-plan events when available.",
+                            "content": { "application/json": { "schema": { "type": "object" } } }
+                        },
+                        "400": { "$ref": "#/components/responses/Error" }
+                    }
+                }
+            },
+            "/telemetry/runtime-snapshots": {
+                "get": {
+                    "parameters": [
+                        { "$ref": "#/components/parameters/Limit" },
+                        {
+                            "name": "runtime_id",
+                            "in": "query",
+                            "required": false,
+                            "schema": { "type": "string" }
+                        }
+                    ],
+                    "responses": {
+                        "200": {
+                            "description": "Current reconciled runtime snapshots plus durable snapshot history when available.",
+                            "content": { "application/json": { "schema": { "type": "object" } } }
                         }
                     }
                 }
@@ -4441,6 +5051,12 @@ pub fn openapi_document() -> serde_json::Value {
                     "in": "path",
                     "required": true,
                     "schema": { "type": "string", "format": "uuid" }
+                },
+                "Limit": {
+                    "name": "limit",
+                    "in": "query",
+                    "required": false,
+                    "schema": { "type": "integer", "minimum": 1, "maximum": 500, "default": 50 }
                 }
             },
             "responses": {
@@ -4578,6 +5194,201 @@ async fn staging(State(state): State<AppState>) -> Json<Vec<StagingIntent>> {
     Json(state.staging_worker.get_all().await)
 }
 
+async fn telemetry_summary(State(state): State<AppState>) -> Json<TelemetrySummary> {
+    let status = state.operator_status().await;
+    let resident_count = status
+        .runtimes
+        .iter()
+        .map(|runtime| runtime.residents.len())
+        .sum();
+    let unavailable_runtime_count = status
+        .runtimes
+        .iter()
+        .filter(|runtime| runtime.availability == "unavailable")
+        .count();
+    let stale_runtime_count = status
+        .runtimes
+        .iter()
+        .filter(|runtime| runtime.freshness == "stale")
+        .count();
+
+    Json(TelemetrySummary {
+        cache_populated: status.cache_populated,
+        runtime_count: status.runtimes.len(),
+        resident_count,
+        unavailable_runtime_count,
+        stale_runtime_count,
+        active_request_count: status.active_request_count,
+        staging: status.staging,
+        recent_decision_count: status.recent_decision_count,
+        policy_warnings: status.policy_warnings,
+        live_execution_enabled: status.live_execution_enabled,
+    })
+}
+
+async fn telemetry_decisions(
+    State(state): State<AppState>,
+    Query(query): Query<TelemetryLimitQuery>,
+) -> Result<Json<TelemetryList<TelemetryDecisionSummary>>, (StatusCode, String)> {
+    let limit = telemetry_limit(query.limit);
+    let mut decisions = state
+        .decision_log
+        .list_decisions()
+        .await
+        .map_err(internal_error)?;
+    decisions.sort_by_key(|decision| std::cmp::Reverse(decision.created_at));
+    decisions.truncate(limit);
+    let items: Vec<_> = decisions
+        .iter()
+        .map(TelemetryDecisionSummary::from)
+        .collect();
+    Ok(Json(TelemetryList {
+        count: items.len(),
+        items,
+        limit,
+    }))
+}
+
+async fn telemetry_decision(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Decision>, (StatusCode, String)> {
+    state
+        .decision_log
+        .get_decision(id)
+        .await
+        .map_err(internal_error)?
+        .map(Json)
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("decision {id} was not found"),
+            )
+        })
+}
+
+async fn telemetry_resident_events(
+    State(state): State<AppState>,
+    Query(query): Query<ResidentEventsQuery>,
+) -> Result<Json<TelemetryList<ResidentEvent>>, (StatusCode, String)> {
+    let limit = telemetry_limit(query.limit);
+    let items = state
+        .decision_log
+        .list_resident_events(query.model_id.as_deref(), limit)
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(TelemetryList {
+        count: items.len(),
+        items,
+        limit,
+    }))
+}
+
+async fn telemetry_staging_events(
+    State(state): State<AppState>,
+    Query(query): Query<TelemetryLimitQuery>,
+) -> Result<Json<TelemetryStagingEvents>, (StatusCode, String)> {
+    let limit = telemetry_limit(query.limit);
+    let mut items = state.staging_worker.get_all().await;
+    items.sort_by_key(|intent| std::cmp::Reverse(intent.created_at));
+    items.truncate(limit);
+    let history = state
+        .decision_log
+        .list_staging_events(limit)
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(TelemetryStagingEvents {
+        count: items.len(),
+        history_count: history.len(),
+        items,
+        history,
+        limit,
+    }))
+}
+
+async fn telemetry_action_plans(
+    State(state): State<AppState>,
+    Query(query): Query<ActionPlansQuery>,
+) -> Result<Json<TelemetryList<ActionPlanEvent>>, (StatusCode, String)> {
+    let limit = telemetry_limit(query.limit);
+    let decision_id = query
+        .decision_id
+        .as_deref()
+        .map(Uuid::parse_str)
+        .transpose()
+        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+    let items = state
+        .decision_log
+        .list_action_plan_events(decision_id, limit)
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(TelemetryList {
+        count: items.len(),
+        items,
+        limit,
+    }))
+}
+
+async fn telemetry_runtime_snapshots(
+    State(state): State<AppState>,
+    Query(query): Query<RuntimeSnapshotsQuery>,
+) -> Result<Json<TelemetryRuntimeSnapshots>, (StatusCode, String)> {
+    let limit = telemetry_limit(query.limit);
+    let reconciled = state.reconciler.all().await;
+    let cache_populated = !reconciled.is_empty();
+    let mut items: Vec<_> = reconciled
+        .into_iter()
+        .filter(|snapshot| {
+            query
+                .runtime_id
+                .as_deref()
+                .is_none_or(|id| id == snapshot.snapshot.runtime_id.0.as_str())
+        })
+        .map(|reconciled| {
+            let availability = if reconciled.snapshot.available {
+                "available"
+            } else {
+                "unavailable"
+            }
+            .to_string();
+            let freshness = if reconciled.is_stale {
+                "stale"
+            } else {
+                "fresh"
+            }
+            .to_string();
+            TelemetryRuntimeSnapshot {
+                runtime_id: reconciled.snapshot.runtime_id.to_string(),
+                availability,
+                freshness,
+                last_inspected: reconciled.last_inspected,
+                last_error: reconciled.last_error,
+                resident_count: reconciled.snapshot.residents.len(),
+                active_request_count: reconciled.snapshot.active_requests.len(),
+                configured_model_count: reconciled.snapshot.configured_models.len(),
+                snapshot: reconciled.snapshot,
+            }
+        })
+        .collect();
+    items.sort_by(|a, b| a.runtime_id.cmp(&b.runtime_id));
+    items.truncate(limit);
+
+    let history = state
+        .decision_log
+        .list_runtime_snapshot_events(query.runtime_id.as_deref(), limit)
+        .await
+        .map_err(internal_error)?;
+
+    Ok(Json(TelemetryRuntimeSnapshots {
+        cache_populated,
+        count: items.len(),
+        history_count: history.len(),
+        items,
+        history,
+        limit,
+    }))
+}
+
 async fn decide(
     State(state): State<AppState>,
     Json(request): Json<InferenceRequest>,
@@ -4606,6 +5417,11 @@ async fn execute(
     let live = state.live_execute_enabled();
     let dry_run = !live;
     let action_plan = state.generate_action_plan(&decision, dry_run);
+    state
+        .decision_log
+        .record_action_plan(&action_plan)
+        .await
+        .map_err(internal_error)?;
 
     // Walk the generated action plan and execute each step, rather than
     // re-deriving a single load from decision.selected_model (which is the

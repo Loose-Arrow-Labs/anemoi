@@ -9,6 +9,7 @@ services:
     environment:
       ANEMOI_BIND: "0.0.0.0:7070"
       ANEMOI_CONFIG: "/app/config/anemoi.yaml"
+      ANEMOI_DASHBOARD_DIST: "/app/web/dashboard/dist"
       ANEMOI_DATABASE_URL: "sqlite:///var/lib/anemoi/events.db"
     volumes:
       - ../../config/anemoi.example.yaml:/app/config/anemoi.yaml:ro

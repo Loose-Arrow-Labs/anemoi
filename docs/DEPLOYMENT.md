@@ -221,6 +221,12 @@ curl https://anemoi.home.arpa/status
 # Residents
 curl http://anemoi.home.arpa/residents
 
+# Telemetry summary
+curl http://anemoi.home.arpa/telemetry/summary
+
+# Dashboard
+open http://anemoi.home.arpa/dashboard/
+
 # Models list (inference gateway)
 curl http://anemoi.home.arpa/v1/models
 curl https://anemoi.home.arpa/v1/models

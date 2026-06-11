@@ -34,24 +34,29 @@ Start here to understand what Anemoi does and how to use it.
    - Troubleshooting production issues
    - Performance tuning
 
-5. **[RELEASE.md](RELEASE.md)** (10 min read)
+5. **[DASHBOARD.md](DASHBOARD.md)** (10 min read)
+   - Browser dashboard
+   - JSON telemetry endpoints
+   - Docker/DNS access
+
+6. **[RELEASE.md](RELEASE.md)** (10 min read)
    - CI badges
    - Tagged release workflow
    - Source-build fallback
 
-6. **[test_roadmap.md](test_roadmap.md)** (reference)
+7. **[test_roadmap.md](test_roadmap.md)** (reference)
    - Complete feature list
    - Test gates and requirements
    - All 28 prompts status (✅ 28/28 complete)
 
 ### Integration Guides
 
-6. **[Pi Integration Guide](../../.pi/ANEMOI_INTEGRATION.md)**
+8. **[Pi Integration Guide](../../.pi/ANEMOI_INTEGRATION.md)**
    - How to use Anemoi in Pi
    - Configuration details
    - Troubleshooting Pi issues
 
-7. **[OpenCode Integration Guide](../../source/repos/pantheon/.opencode/ANEMOI_INTEGRATION.md)**
+9. **[OpenCode Integration Guide](../../source/repos/pantheon/.opencode/ANEMOI_INTEGRATION.md)**
    - How to use Anemoi in OpenCode
    - Configuration details
    - Model selection
@@ -279,6 +284,7 @@ sqlite3 anemoi-events.db "SELECT model FROM decisions WHERE id = '<decision-id>'
 
 ### Main Documentation
 - `README.md` - Main readme with features and quick start
+- `DASHBOARD.md` - Telemetry dashboard and JSON endpoint reference
 - `GETTING_STARTED.md` - Complete walkthrough for users and operators
 - `INFERENCE_GATEWAY.md` - Deep dive on the OpenAI-compatible gateway
 - `DEPLOYMENT.md` - Production deployment and operations
