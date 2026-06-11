@@ -2,6 +2,9 @@
 
 This guide covers deploying Anemoi to production environments.
 
+Deployment is a beta surface. Review [Known Limitations](LIMITATIONS.md)
+before exposing Anemoi beyond loopback.
+
 ## Pre-Deployment Checklist
 
 - [ ] All tests passing: `cargo test --workspace`
@@ -68,7 +71,9 @@ domains:
 
 ## Step 3: Configure Reverse Proxy (Traefik Example)
 
-Create `traefik/anemoi.yml`:
+Use the checked-in example at
+`deploy/traefik/anemoi.home.arpa.yml`, or create an equivalent dynamic
+configuration:
 
 ```yaml
 http:
@@ -76,36 +81,38 @@ http:
     anemoi:
       loadBalancer:
         servers:
-          - url: "http://localhost:7070"
+          - url: "http://anemoi:7070"
 
   routers:
     anemoi-http:
       rule: "Host(`anemoi.home.arpa`)"
       service: anemoi
-      entrypoints: web
-      middlewares: ["ip-allowlist"]
+      entryPoints: [web]
+      middlewares: ["anemoi-local-only"]
     
     anemoi-https:
       rule: "Host(`anemoi.home.arpa`)"
       service: anemoi
-      entrypoints: websecure
-      middlewares: ["ip-allowlist"]
-      tls:
-        certResolver: "letsencrypt"
+      entryPoints: [websecure]
+      middlewares: ["anemoi-local-only"]
+      tls: {}
 
 middlewares:
-  ip-allowlist:
+  anemoi-local-only:
     ipAllowList:
       sourceRange:
-        - "127.0.0.1"
-        - "192.168.1.0/24"
-      rejectStatusCode: 403
+        - "127.0.0.1/32"
+        - "10.0.0.0/8"
+        - "172.16.0.0/12"
+        - "192.168.0.0/16"
 ```
 
 **Key points**:
 - Route via hostname: `anemoi.home.arpa`
-- IP allowlist restricts access
-- Optional TLS for HTTPS (requires valid cert)
+- Route to the daemon on port `7070`
+- Keep the route LAN-only unless you add authentication and TLS explicitly
+- If Traefik runs on the host instead of the compose network, point the service
+  at `http://127.0.0.1:7070` or another host-reachable address
 
 ## Step 4: Set Up Database
 
@@ -171,50 +178,61 @@ sudo systemctl status anemoi
 
 ### Option C: Docker Container
 
-Create `Dockerfile`:
+Use the checked-in Docker files:
 
-```dockerfile
-FROM rust:latest as builder
-
-WORKDIR /build
-COPY . .
-RUN cargo build --release -p anemoi-daemon
-
-FROM ubuntu:22.04
-
-RUN apt-get update && apt-get install -y libssl3 ca-certificates
-COPY --from=builder /build/target/release/anemoi-daemon /usr/local/bin/
-
-RUN mkdir -p /var/lib/anemoi
-RUN chmod 777 /var/lib/anemoi
-
-EXPOSE 7070
-
-ENTRYPOINT ["anemoi-daemon"]
+```powershell
+docker compose -f deploy/docker/docker-compose.yml up --build
 ```
 
-Build and run:
+The compose file runs the Rust daemon with:
+
+```text
+ANEMOI_BIND=0.0.0.0:7070
+ANEMOI_CONFIG=/app/config/anemoi.yaml
+host 7070 -> container 7070
+```
+
+For a direct `docker run` equivalent:
+
 ```bash
-docker build -t anemoi:latest .
+docker build -f deploy/docker/Dockerfile -t anemoi:latest .
 docker run -d \
   --name anemoi \
   -p 7070:7070 \
-  -v /etc/anemoi:/etc/anemoi \
+  -e ANEMOI_BIND=0.0.0.0:7070 \
+  -e ANEMOI_CONFIG=/app/config/anemoi.yaml \
+  -v /etc/anemoi/anemoi.yaml:/app/config/anemoi.yaml:ro \
   -v /var/lib/anemoi:/var/lib/anemoi \
   anemoi:latest
 ```
+
+Loopback development (`127.0.0.1:7070`) is for same-machine use. Container,
+LAN, and DNS deployments must bind `0.0.0.0:7070` inside the container so the
+published port and reverse proxy can reach the daemon.
 
 ## Step 6: Verify Deployment
 
 ```bash
 # Health check
 curl http://anemoi.home.arpa/health
+curl https://anemoi.home.arpa/health
 
 # Status
 curl http://anemoi.home.arpa/status
+curl https://anemoi.home.arpa/status
+
+# Residents
+curl http://anemoi.home.arpa/residents
+
+# Telemetry summary
+curl http://anemoi.home.arpa/telemetry/summary
+
+# Dashboard
+open http://anemoi.home.arpa/dashboard/
 
 # Models list (inference gateway)
 curl http://anemoi.home.arpa/v1/models
+curl https://anemoi.home.arpa/v1/models
 
 # Test inference request
 curl -X POST http://anemoi.home.arpa/v1/chat/completions \
@@ -222,7 +240,15 @@ curl -X POST http://anemoi.home.arpa/v1/chat/completions \
   -d '{"model":"coding","messages":[{"role":"user","content":"test"}],"max_tokens":10}'
 ```
 
-All should respond with 200 OK.
+After the telemetry dashboard issue lands on the deployed version, the same DNS
+route should also serve:
+
+```bash
+curl http://anemoi.home.arpa/telemetry/summary
+curl http://anemoi.home.arpa/dashboard
+```
+
+All enabled routes should respond with 200 OK.
 
 ## Step 7: Set Up Monitoring
 

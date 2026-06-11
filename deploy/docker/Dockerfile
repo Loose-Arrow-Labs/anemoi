@@ -26,6 +26,13 @@ FROM debian:bookworm-slim AS runtime
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates libssl3 curl \
     && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+RUN mkdir -p config
 COPY --from=builder /build/target/release/anemoi-daemon /usr/local/bin/anemoi-daemon
+COPY --from=builder /build/config/anemoi.example.yaml /app/config/anemoi.yaml
+COPY --from=builder /build/web/dashboard/dist /app/web/dashboard/dist
+ENV ANEMOI_BIND=0.0.0.0:7070
+ENV ANEMOI_CONFIG=/app/config/anemoi.yaml
+ENV ANEMOI_DASHBOARD_DIST=/app/web/dashboard/dist
 EXPOSE 7070
 ENTRYPOINT ["/usr/local/bin/anemoi-daemon"]

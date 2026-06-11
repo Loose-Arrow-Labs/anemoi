@@ -3,6 +3,9 @@
 This folder contains ordered implementation prompts for building Anemoi with
 test-driven development.
 
+These prompts are historical build records. For current beta caveats and
+implemented-vs-pending status, see [Known Limitations](../LIMITATIONS.md).
+
 Each prompt should produce one reviewable change. Tests must be single-scoped:
 one behavior, one rule, one reason to fail. Do not combine unrelated behavior
 unless the prompt explicitly names an end-to-end smoke test.

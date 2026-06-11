@@ -1,5 +1,12 @@
 # Anemoi
 
+[![CI](https://github.com/Loose-Arrow-Labs/anemoi/actions/workflows/ci.yml/badge.svg)](https://github.com/Loose-Arrow-Labs/anemoi/actions/workflows/ci.yml)
+[![Release](https://github.com/Loose-Arrow-Labs/anemoi/actions/workflows/release.yml/badge.svg)](https://github.com/Loose-Arrow-Labs/anemoi/actions/workflows/release.yml)
+
+**Status**: Beta. CI is active and tagged release artifacts are prepared through
+the release workflow; live runtime, Docker/DNS, and dashboard readiness are
+tracked in [Known Limitations](docs/LIMITATIONS.md).
+
 Anemoi is a local-first inference governance layer that chooses the best
 available runtime model, explains why, and records every decision.
 
@@ -12,6 +19,18 @@ Anemoi sits in front of local runtimes such as llama-swap, Ollama, and
 llama.cpp. Clients send a governance domain like `coding`; Anemoi inspects
 runtime state, scores eligible candidates, chooses a model/runtime path, and
 returns headers and records that explain the decision.
+
+## Dashboard
+
+A read-only operator view of every decision — what was selected, why, and what was
+rejected or staged instead:
+
+![Anemoi telemetry dashboard: a stage-background decision selecting the hot qwen9b worker, with its scored reasons (continuity, quality_stage), the rejected larger model (cold load exceeds the latency budget), live resident state, runtime health, and the live-execution gate chip](assets/dashboard-decision.png)
+
+The daemon serves this Vite/TypeScript dashboard at `/dashboard/` from read-only
+telemetry endpoints. See [docs/DASHBOARD.md](docs/DASHBOARD.md) to run it, and
+[reproduce this screenshot](docs/DASHBOARD.md#reproduce-this-screenshot) from
+fixture data (no live runtime required).
 
 ## Quickstart
 
@@ -116,8 +135,8 @@ flowchart LR
 | `POST /v1/chat/completions` | OpenAI-compatible gateway request governed by Anemoi. |
 | `GET /openapi.json` | OpenAPI document for the daemon API. |
 
-Dashboard and telemetry JSON endpoints are tracked in issue #130 and will be
-linked here once that PR lands.
+The read-only dashboard at `/dashboard/` and its telemetry JSON endpoints are
+documented in [docs/DASHBOARD.md](docs/DASHBOARD.md).
 
 ## Operator Commands
 
@@ -178,15 +197,18 @@ Important limits:
 - Anemoi does not host or download models.
 - Live runtime mutation requires explicit execution paths and safety gates.
 - Provider-gateway behavior is not the core v1 goal.
-- Dashboard and expanded telemetry endpoints are in flight in issue #130.
-- Docker/DNS hardening for `anemoi.home.arpa` is in flight in issue #131.
-- Legacy .NET residue is tracked separately in issue #129.
+
+[docs/LIMITATIONS.md](docs/LIMITATIONS.md) centralizes the live-runtime,
+Docker/DNS, dashboard, MCP, and security caveats and their readiness status.
 
 ## Deeper Docs
 
 - [Getting Started](docs/GETTING_STARTED.md)
 - [Inference Gateway](docs/INFERENCE_GATEWAY.md)
+- [Dashboard](docs/DASHBOARD.md)
 - [Deployment](docs/DEPLOYMENT.md)
+- [Release](docs/RELEASE.md)
+- [Known Limitations](docs/LIMITATIONS.md)
 - [Live Validation](docs/live_validation/README.md)
 - [Test Roadmap](docs/test_roadmap.md)
 - [Contributing](CONTRIBUTING.md)

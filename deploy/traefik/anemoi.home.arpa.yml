@@ -1,0 +1,33 @@
+http:
+  services:
+    anemoi:
+      loadBalancer:
+        servers:
+          - url: "http://anemoi:7070"
+
+  routers:
+    anemoi-http:
+      rule: "Host(`anemoi.home.arpa`)"
+      service: anemoi
+      entryPoints:
+        - web
+      middlewares:
+        - anemoi-local-only
+
+    anemoi-https:
+      rule: "Host(`anemoi.home.arpa`)"
+      service: anemoi
+      entryPoints:
+        - websecure
+      middlewares:
+        - anemoi-local-only
+      tls: {}
+
+  middlewares:
+    anemoi-local-only:
+      ipAllowList:
+        sourceRange:
+          - "127.0.0.1/32"
+          - "10.0.0.0/8"
+          - "172.16.0.0/12"
+          - "192.168.0.0/16"
