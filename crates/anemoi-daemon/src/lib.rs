@@ -126,7 +126,7 @@ impl Reconciler {
 
     pub async fn mark_stale(&self) {
         let mut cache = self.cache.write().await;
-        for (_, reconciled) in cache.iter_mut() {
+        for reconciled in cache.values_mut() {
             reconciled.is_stale = true;
         }
     }
