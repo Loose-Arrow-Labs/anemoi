@@ -55,6 +55,13 @@ loop.
 | `25-eviction-and-pinning-policy.md` | Protect keep-hot workers and produce explainable eviction plans. |
 | `26-operator-status-surface.md` | Make status useful as an operator-facing control-plane surface. |
 | `27-durable-event-store.md` | Add optional durable event history once the governance loop is proven. |
+| `28-inference-forwarding-gateway.md` | Expose an OpenAI-compatible endpoint that decides, forwards, and streams. |
+| `30-gateway-selection-signals.md` | Carry gateway request shape into policy as explicit selection signals. |
+| `31-concurrent-transition-coordination.md` | Arbitrate concurrent residency transitions deterministically. |
+| `32-displacement-aware-routing.md` | Score the cost a candidate imposes on the incumbent resident. |
+
+Prompt 29 (llama-swap residency events, issue #62) landed without a prompt
+file; see `../test_roadmap.md` for its gate and required tests.
 
 ## Standard Validation
 
