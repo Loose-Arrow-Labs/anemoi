@@ -75,6 +75,18 @@ What to look for:
 With the default config, the request domain is `coding`, the runtime adapter is
 `mock`, and the selected model comes from `config/anemoi.example.yaml`.
 
+The `cargo run` quickstart above is the mock demo path. Production deployment is
+Docker (multi-stage build; container binds `0.0.0.0:7070`, and reaches a
+host-run llama-swap via `host.docker.internal`). See
+[Deployment](docs/DEPLOYMENT.md) for the Docker path and required env
+(`ANEMOI_BIND`, `ANEMOI_ENABLE_LIVE_EXECUTE`, and the `config_path` caveat).
+
+What forwards vs. what is pending: `POST /v1/chat/completions` is the gateway
+that actually forwards inference to the selected runtime, whereas `POST
+/execute` is a decision + action-plan/model-load handoff only and reports
+`handoff.full_inference_forwarded: false`. The escalation/handoff flow is
+still scaffolding; see [Known Limitations](docs/LIMITATIONS.md).
+
 ## What Anemoi Does
 
 Anemoi answers:
@@ -127,12 +139,12 @@ flowchart LR
 | `GET /status` | Operator summary of runtimes, residents, staging, warnings, and policy state. |
 | `GET /residents` | Normalized runtime residency snapshots. |
 | `POST /decide` | Return a scheduling decision without executing inference. |
-| `POST /execute` | Decide and return an explicit action-plan handoff. |
+| `POST /execute` | Decide and return an explicit action-plan/model-load handoff (does **not** forward inference; `full_inference_forwarded: false`). |
 | `GET /staging` | List background staging intents and skip reasons. |
 | `GET /decisions/:id` | Fetch a recorded decision. |
 | `GET /explain/:id` | Fetch the explanation for a recorded decision. |
 | `GET /v1/models` | OpenAI-compatible list of governance domains. |
-| `POST /v1/chat/completions` | OpenAI-compatible gateway request governed by Anemoi. |
+| `POST /v1/chat/completions` | OpenAI-compatible gateway that actually forwards the request to the selected runtime (live non-mock forwarding requires `ANEMOI_ENABLE_LIVE_EXECUTE=1`). |
 | `GET /openapi.json` | OpenAPI document for the daemon API. |
 
 The read-only dashboard at `/dashboard/` and its telemetry JSON endpoints are
