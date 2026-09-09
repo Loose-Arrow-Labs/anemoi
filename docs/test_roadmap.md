@@ -7,7 +7,7 @@ but a prompt is not accepted until its tests prove the contract named here.
 
 ## Summary (2026-06-01)
 
-All core features are complete and production-ready:
+Core features are implemented and their prompt tests pass. Overall status is **Beta**: the mock demo path and the OpenAI-compatible gateway are operational, but live-runtime, Docker/DNS, and escalation/handoff readiness are tracked in [Known Limitations](LIMITATIONS.md).
 - **Prompts 00-31**: All passing with required tests
 - **Issues #30-34**: All merged to main with full integration
 - **Issue #77**: Gateway request shape now reaches policy as selection signals
