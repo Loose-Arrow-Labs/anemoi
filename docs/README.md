@@ -329,9 +329,14 @@ sqlite3 anemoi-events.db "SELECT model FROM decisions WHERE id = '<decision-id>'
 
 ## Last Updated
 
-- **Documentation**: May 30, 2026
-- **Code Status**: All issues #30-34 complete and merged
-- **Production Ready**: ✅ Yes
+- **Documentation**: Sep 9, 2026
+- **Code Status**: Issues #30-34 complete and merged
+- **Overall Status**: Beta. The mock demo path and the OpenAI-compatible
+  `/v1/chat/completions` gateway (which actually forwards inference to the
+  selected runtime) are operational. Escalation/handoff (`POST /execute`) is
+  still a load-only handoff and does not forward full inference
+  (`full_inference_forwarded: false`). See [Known Limitations](LIMITATIONS.md)
+  for the authoritative readiness matrix.
 - **Test Coverage**: ✅ 28/28 prompts passing
 
 ---

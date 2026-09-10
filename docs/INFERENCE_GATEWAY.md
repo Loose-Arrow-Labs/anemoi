@@ -301,6 +301,17 @@ What anemoi did with your request:
 | `mock-forward` | Request simulated (testing mode) |
 | `decision-only` | Decision made but not executed |
 
+### The gateway forwards; `/execute` does not
+
+`/v1/chat/completions` is the surface that **actually forwards inference** to the
+selected runtime. `POST /execute` is a related but different endpoint: it runs
+the same decision and returns an **action-plan / model-load handoff**, and always
+reports `handoff.full_inference_forwarded: false` — it never forwards the user's
+inference to the model itself. Use `/v1/chat/completions` for real inference;
+use `/execute` when you want the decision plus the load/staging plan. See
+[Known Limitations](LIMITATIONS.md) for the readiness status of the
+escalation/handoff flow.
+
 ---
 
 ## Error Handling
