@@ -17,6 +17,7 @@ use super::event_stream::{
     residents_from_states, run_event_stream, LlamaSwapEventStream, ModelStateCache,
 };
 use super::matrix::LlamaSwapMatrixConfig;
+use super::metrics::parse_llama_swap_memory_metrics;
 
 #[derive(Debug, Clone)]
 pub struct LlamaSwapAdapter {
@@ -154,6 +155,28 @@ impl LlamaSwapAdapter {
             .collect())
     }
 
+    /// Fetches and parses llama-swap's Prometheus `/metrics` endpoint into a
+    /// [`RuntimeMemorySnapshot`] (VRAM and host RAM in MB). Returns a
+    /// [`RuntimeError`] when the endpoint is unreachable or returns a non-2xx
+    /// status; the caller decides how to degrade (typically to an empty
+    /// snapshot so every field reads `None`/unknown).
+    async fn inspect_memory(&self) -> Result<RuntimeMemorySnapshot, RuntimeError> {
+        let url = self
+            .base_url
+            .join("/metrics")
+            .map_err(|error| RuntimeError::Url(error.to_string()))?;
+        let body = self
+            .client
+            .get(url)
+            .headers(self.headers()?)
+            .send()
+            .await?
+            .error_for_status()?
+            .text()
+            .await?;
+        Ok(parse_llama_swap_memory_metrics(&body))
+    }
+
     fn headers(&self) -> Result<HeaderMap, RuntimeError> {
         let mut headers = HeaderMap::new();
         if let Some(token) = &self.auth_token {
@@ -226,6 +249,22 @@ impl RuntimeAdapter for LlamaSwapAdapter {
             residents_from_states(&states)
         };
 
+        // llama-swap serves Prometheus memory metrics at `/metrics`. A metrics
+        // failure (endpoint absent, 5xx, timeout) must not make a healthy
+        // runtime look unavailable nor lie about memory: fall back to the empty
+        // snapshot so every field reads `None` (unknown), never `Some(0)`.
+        let memory = self
+            .inspect_memory()
+            .await
+            .unwrap_or_else(|error| {
+                tracing::warn!(
+                    runtime = %self.id,
+                    %error,
+                    "memory metrics fetch failed after a healthy /health probe; reporting unknown memory"
+                );
+                RuntimeMemorySnapshot::default()
+            });
+
         Ok(RuntimeSnapshot {
             runtime_id: self.id.clone(),
             available: true,
@@ -235,7 +274,7 @@ impl RuntimeAdapter for LlamaSwapAdapter {
             // docs/live_validation/residency-truth-contract.md.
             residents,
             configured_models,
-            memory: RuntimeMemorySnapshot::default(),
+            memory,
             active_requests: Vec::new(),
             colocation: self.colocation_constraints(),
         })
