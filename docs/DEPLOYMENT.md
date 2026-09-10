@@ -5,6 +5,42 @@ This guide covers deploying Anemoi to production environments.
 Deployment is a beta surface. Review [Known Limitations](LIMITATIONS.md)
 before exposing Anemoi beyond loopback.
 
+The supported production path is **Docker** (multi-stage build; the release
+image ships only the `anemoi-daemon` binary plus its dynamic deps). When the
+daemon runs in a container and llama-swap runs on the host, the daemon reaches
+llama-swap through `host.docker.internal` (e.g. `http://host.docker.internal:8085`).
+Building a bare binary and running it under systemd/`nohup` is still supported
+for same-machine or bare-metal use, but Docker is the reference deployment.
+
+## Required Environment
+
+The daemon reads the following environment variables at startup. The Docker
+image/compose set the container-appropriate defaults; source/systemd runs must
+set them explicitly.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `ANEMOI_BIND` | `127.0.0.1:7070` | Socket the daemon binds. Loopback by default. In Docker (and for any reverse proxy such as Traefik on another host) this must be `0.0.0.0:7070` so the published port and proxy can reach the daemon — the image and compose already set `ANEMOI_BIND=0.0.0.0:7070`. |
+| `ANEMOI_CONFIG` | `config/anemoi.example.yaml` | Path to the Anemoi YAML config. The image sets `/app/config/anemoi.yaml`. |
+| `ANEMOI_ENABLE_LIVE_EXECUTE` | unset | Safety gate. Must be `1` before Anemoi mutates a **non-mock** runtime (live load/unload) or forwards a `/v1/chat/completions` request to a **non-mock** runtime. Unset means mutating/forwarding actions are recorded as blocked/skipped instead of executed. |
+| `ANEMOI_LLAMA_SWAP_BASE_URL` | none | Base URL of llama-swap, expanded from `${...}` in the config. When llama-swap runs on the host and the daemon is containerized, set `http://host.docker.internal:8085` (`172.17.0.1:8085` is the equivalent docker-bridge address). See `docs/live_validation/llama-swap-live-path.md`. |
+| `ANEMOI_DATABASE_URL` | none | Durable event store, e.g. `sqlite:///var/lib/anemoi/events.db`. Unset falls back to the in-memory/JSONL decision log. |
+| `ANEMOI_DASHBOARD_DIST` | none | Directory holding the built dashboard assets served at `/dashboard/`. The image sets `/app/web/dashboard/dist`. |
+
+### `config_path` caveat (issue #114)
+
+A `llama_swap` runtime entry may set `config_path` to read llama-swap's `matrix`
+block at startup. This is only worth enabling when you want Anemoi to mirror
+llama-swap's own matrix. Note:
+
+- If the file is missing or unparseable, adapter construction fails and the
+  **daemon exits at startup** rather than serving. Verify the path before
+  starting a production instance.
+- Older builds crashed on real-world matrix configs (string `vars` aliases and
+  mapping-form `sets`). That parser bug is fixed (the parser now accepts numeric
+  *and* string `vars`, and both sequence and mapping `sets` forms), but reading
+  an external file at startup is still a startup-time dependency you own.
+
 ## Pre-Deployment Checklist
 
 - [ ] All tests passing: `cargo test --workspace`
@@ -130,7 +166,62 @@ sqlite3 /var/lib/anemoi/events.db ".tables"
 
 ## Step 5: Start the Daemon
 
-### Option A: Direct Execution
+### Option A: Docker (recommended)
+
+Use the checked-in Docker files. The multi-stage `Dockerfile` builds the release
+binary from the checkout and ships only the binary plus its dynamic deps; the
+compose file wires the container-appropriate env and mounts.
+
+```bash
+docker compose -f deploy/docker/docker-compose.yml up --build
+```
+
+The compose file runs the Rust daemon with:
+
+```text
+ANEMOI_BIND=0.0.0.0:7070          # bind inside the container so the published port works
+ANEMOI_CONFIG=/app/config/anemoi.yaml
+ANEMOI_DASHBOARD_DIST=/app/web/dashboard/dist
+ANEMOI_DATABASE_URL=sqlite:///var/lib/anemoi/events.db
+host 7070 -> container 7070
+```
+
+To let a containerized daemon reach llama-swap running on the host, add
+`extra_hosts` (Docker Desktop provides `host.docker.internal` automatically;
+on Linux use `network_mode: host` or the docker-bridge address) and point the
+runtime at it:
+
+```yaml
+    environment:
+      ANEMOI_LLAMA_SWAP_BASE_URL: "http://host.docker.internal:8085"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+```
+
+Set `ANEMOI_ENABLE_LIVE_EXECUTE=1` only when you intend Anemoi to actually load
+models on, or forward to, that live runtime; leave it unset for decision-only
+operation.
+
+For a direct `docker run` equivalent:
+
+```bash
+docker build -f deploy/docker/Dockerfile -t anemoi:latest .
+docker run -d \
+  --name anemoi \
+  -p 7070:7070 \
+  -e ANEMOI_BIND=0.0.0.0:7070 \
+  -e ANEMOI_CONFIG=/app/config/anemoi.yaml \
+  --add-host=host.docker.internal:host-gateway \
+  -v /etc/anemoi/anemoi.yaml:/app/config/anemoi.yaml:ro \
+  -v /var/lib/anemoi:/var/lib/anemoi \
+  anemoi:latest
+```
+
+Loopback development (`127.0.0.1:7070`) is for same-machine use. Container,
+LAN, and DNS deployments must bind `0.0.0.0:7070` inside the container so the
+published port and reverse proxy can reach the daemon.
+
+### Option B: Direct Execution
 
 ```powershell
 ./target/release/anemoi-daemon
@@ -146,7 +237,7 @@ Output:
 [INFO] Ready to accept requests
 ```
 
-### Option B: Systemd Service (Linux)
+### Option C: Systemd Service (Linux)
 
 Create `/etc/systemd/system/anemoi.service`:
 
@@ -175,40 +266,6 @@ sudo systemctl enable anemoi
 sudo systemctl start anemoi
 sudo systemctl status anemoi
 ```
-
-### Option C: Docker Container
-
-Use the checked-in Docker files:
-
-```powershell
-docker compose -f deploy/docker/docker-compose.yml up --build
-```
-
-The compose file runs the Rust daemon with:
-
-```text
-ANEMOI_BIND=0.0.0.0:7070
-ANEMOI_CONFIG=/app/config/anemoi.yaml
-host 7070 -> container 7070
-```
-
-For a direct `docker run` equivalent:
-
-```bash
-docker build -f deploy/docker/Dockerfile -t anemoi:latest .
-docker run -d \
-  --name anemoi \
-  -p 7070:7070 \
-  -e ANEMOI_BIND=0.0.0.0:7070 \
-  -e ANEMOI_CONFIG=/app/config/anemoi.yaml \
-  -v /etc/anemoi/anemoi.yaml:/app/config/anemoi.yaml:ro \
-  -v /var/lib/anemoi:/var/lib/anemoi \
-  anemoi:latest
-```
-
-Loopback development (`127.0.0.1:7070`) is for same-machine use. Container,
-LAN, and DNS deployments must bind `0.0.0.0:7070` inside the container so the
-published port and reverse proxy can reach the daemon.
 
 ## Step 6: Verify Deployment
 
@@ -249,6 +306,23 @@ curl http://anemoi.home.arpa/dashboard
 ```
 
 All enabled routes should respond with 200 OK.
+
+### What forwards inference vs. what is still pending
+
+Two surfaces are easy to confuse:
+
+- **`POST /v1/chat/completions`** — the OpenAI-compatible **inference gateway**.
+  It runs the decision and **forwards** the request to the selected runtime
+  (rewriting `model`, stripping private `anemoi` metadata, injecting auth). This
+  is what actually forwards inference. For a **non-mock** runtime it still
+  requires `ANEMOI_ENABLE_LIVE_EXECUTE=1`; without the gate the forward is
+  recorded as blocked instead of sent.
+- **`POST /execute`** — an **action-plan / model-load handoff** only. It logs
+  the decision, walks the plan (loading models when the live gate is open), and
+  returns `handoff.full_inference_forwarded: false`. It does **not** forward the
+  user's inference to the model. The escalation/handoff flow is scaffolding
+  pending further work; treat `/execute` as "stage and tell me what would run",
+  not as an inference endpoint.
 
 ## Step 7: Set Up Monitoring
 
