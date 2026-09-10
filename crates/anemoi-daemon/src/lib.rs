@@ -4050,12 +4050,19 @@ continuity:
 
     #[tokio::test]
     async fn inference_gateway_large_context_request_selects_larger_context_model() {
+        // wide32b is a cold load (~45000 ms). Since issue #173 the gateway
+        // refuses to forward a cold load that exceeds the caller's wait
+        // allowance, so this test declares a budget that covers the estimate to
+        // keep proving the original behaviour: a large-context request selects
+        // and forwards the larger-context model. See
+        // `test_cold_load_surfaces_retry_after` for the over-budget case.
         let body = serde_json::json!({
             "model": "coding",
             "messages": [{ "role": "user", "content": "large context request" }],
             "anemoi": {
                 "prompt_tokens_estimate": 20000,
-                "max_output_tokens": 1000
+                "max_output_tokens": 1000,
+                "latency_budget_ms": 60000
             }
         });
 
@@ -4073,6 +4080,118 @@ continuity:
                 .to_str()
                 .expect("ascii"),
             "wide32b"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cold_load_surfaces_retry_after() {
+        // wide32b is a cold load (~45000 ms) and the request carries no explicit
+        // latency budget, so the gateway default (30000 ms) is exceeded. The
+        // gateway must refuse now with a retryable 503 rather than forward and
+        // let the connection sit idle through the whole load (issue #173).
+        let body = serde_json::json!({
+            "model": "coding",
+            "messages": [{ "role": "user", "content": "large context request" }],
+            "anemoi": { "prompt_tokens_estimate": 20000, "max_output_tokens": 1000 }
+        });
+
+        let response = router(large_context_gateway_state())
+            .oneshot(json_request("/v1/chat/completions", &body))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        // Retry-After is whole seconds derived from the 45000 ms estimate.
+        assert_eq!(
+            response
+                .headers()
+                .get("retry-after")
+                .expect("Retry-After header")
+                .to_str()
+                .expect("ascii"),
+            "45"
+        );
+
+        // The decision headers match the success path so the client can poll.
+        let decision_id = decision_id_header(&response);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-anemoi-selected-model")
+                .expect("selected model header")
+                .to_str()
+                .expect("ascii"),
+            "wide32b"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("x-anemoi-action")
+                .expect("action header")
+                .to_str()
+                .expect("ascii"),
+            "cold_load"
+        );
+
+        // Body carries the decision id, the estimate and the explanation.
+        let body = body_value(response).await;
+        assert_eq!(body["error"]["type"], "anemoi_cold_load_pending");
+        assert_eq!(body["cold_load_estimate_ms"], 45000);
+        assert_eq!(
+            body["error"]["decision_id"].as_str().expect("decision id"),
+            decision_id.to_string()
+        );
+        assert!(
+            !body["explanation"].as_str().unwrap_or_default().is_empty(),
+            "cold load 503 must include the decision explanation summary"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cold_load_within_budget_forwards_normally() {
+        // Same cold load (~45000 ms) but the caller declares a budget that covers
+        // it, so the gateway forwards exactly as before: 200 OK with an SSE body
+        // and the cold_load action echoed. This proves normal forwarding is
+        // intact for within-budget cold loads.
+        let body = serde_json::json!({
+            "model": "coding",
+            "messages": [{ "role": "user", "content": "large context request" }],
+            "anemoi": {
+                "prompt_tokens_estimate": 20000,
+                "max_output_tokens": 1000,
+                "latency_budget_ms": 60000
+            }
+        });
+
+        let response = router(large_context_gateway_state())
+            .oneshot(json_request("/v1/chat/completions", &body))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-anemoi-action")
+                .expect("action header")
+                .to_str()
+                .expect("ascii"),
+            "cold_load"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("x-anemoi-selected-model")
+                .expect("selected model header")
+                .to_str()
+                .expect("ascii"),
+            "wide32b"
+        );
+        let text = body_text(response).await;
+        assert!(
+            text.contains("data:"),
+            "within-budget cold load should still forward an SSE stream"
         );
     }
 
@@ -6814,6 +6933,29 @@ async fn chat_completions(
         );
     }
 
+    // Issue #173: when the decision requires a cold load that is estimated to
+    // take longer than the caller is willing to wait, refuse now with a
+    // retryable 503 instead of forwarding and letting the connection sit idle
+    // through the whole load (until a proxy or SDK timeout kills it). The load
+    // succeeds but the client is already gone; surfacing status lets the client
+    // back off and poll `/explain/:id` instead.
+    if decision.action == DecisionAction::ColdLoad {
+        let effective = state.governance.effective();
+        let cold_load_estimate_ms = effective
+            .config
+            .models
+            .get(&selected_model)
+            .and_then(|profile| profile.cold_load_estimate_ms);
+        let wait_allowance_ms = request
+            .latency_budget_ms
+            .unwrap_or(effective.config.continuity.max_blank_wait_ms);
+        if let Some(estimate) = cold_load_estimate_ms {
+            if estimate > wait_allowance_ms {
+                return cold_load_unavailable(&decision, &selected_model, estimate);
+            }
+        }
+    }
+
     // The caller's domain hint is replaced with the governed model id. Private
     // Anemoi metadata is consumed locally and never forwarded to runtimes.
     let body = gateway_forward_body(body, &selected_model);
@@ -6841,6 +6983,50 @@ async fn chat_completions(
     };
 
     gateway_stream_response(forwarded, &decision, &selected_model)
+}
+
+/// Builds the `503 Service Unavailable` response used when a `ColdLoad`
+/// decision would exceed the caller's wait allowance (issue #173). It echoes
+/// the same `x-anemoi-*` headers the success path emits so the caller can poll
+/// `/explain/:id`, sets a whole-second `Retry-After`, and includes the estimate
+/// and explanation summary in the body.
+fn cold_load_unavailable(
+    decision: &Decision,
+    selected_model: &ModelId,
+    cold_load_estimate_ms: u64,
+) -> Response {
+    // Whole seconds, rounded up, with a floor of 1 so a sub-second estimate
+    // still yields a usable `Retry-After`.
+    let retry_after_secs = (cold_load_estimate_ms.saturating_add(999) / 1000).max(1);
+    let body = serde_json::json!({
+        "error": {
+            "message": format!(
+                "selected model `{selected_model}` needs a cold load (~{cold_load_estimate_ms} ms) that exceeds the request wait allowance; retry in ~{retry_after_secs}s or poll /explain/{}",
+                decision.id
+            ),
+            "type": "anemoi_cold_load_pending",
+            "code": "cold_load_exceeds_budget",
+            "decision_id": decision.id.to_string(),
+        },
+        "cold_load_estimate_ms": cold_load_estimate_ms,
+        "retry_after_seconds": retry_after_secs,
+        "explanation": decision.explanation.summary,
+    });
+    let mut response = (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response();
+    let headers = response.headers_mut();
+    if let Ok(value) = HeaderValue::from_str(&retry_after_secs.to_string()) {
+        headers.insert(header::RETRY_AFTER, value);
+    }
+    if let Ok(value) = HeaderValue::from_str(&decision.id.to_string()) {
+        headers.insert("x-anemoi-decision-id", value);
+    }
+    if let Ok(value) = HeaderValue::from_str(&selected_model.to_string()) {
+        headers.insert("x-anemoi-selected-model", value);
+    }
+    if let Ok(value) = HeaderValue::from_str(&decision_action_str(&decision.action)) {
+        headers.insert("x-anemoi-action", value);
+    }
+    response
 }
 
 fn gateway_stream_response(
