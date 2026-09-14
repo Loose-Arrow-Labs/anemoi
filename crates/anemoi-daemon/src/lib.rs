@@ -4509,6 +4509,108 @@ continuity:
         );
     }
 
+    #[tokio::test]
+    async fn inference_gateway_error_embeds_explanation_when_decision_exists() {
+        let state = non_mock_gateway_state(false);
+        state
+            .reconciler()
+            .update("remote", remote_hot_snapshot())
+            .await;
+
+        let response = router(state)
+            .oneshot(json_request("/v1/chat/completions", &chat_body("coding")))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let decision_id = decision_id_header(&response);
+        let body = body_value(response).await;
+        let explanation = body["error"]["explanation"]
+            .as_object()
+            .expect("gateway error embeds the structured explanation");
+        assert!(
+            explanation
+                .get("reasons")
+                .and_then(Value::as_array)
+                .map(|reasons| !reasons.is_empty())
+                .unwrap_or(false),
+            "embedded explanation must carry the decision's reasons"
+        );
+        assert_eq!(
+            body["error"]["decision_id"].as_str().expect("decision_id"),
+            decision_id.to_string(),
+            "embedded explanation must belong to the reported decision"
+        );
+    }
+
+    #[tokio::test]
+    async fn inference_gateway_error_omits_explanation_without_decision() {
+        let request_body = serde_json::json!({
+            "messages": [{ "role": "user", "content": "hello" }]
+        });
+
+        let response = test_router()
+            .oneshot(json_request("/v1/chat/completions", &request_body))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            response.headers().get("x-anemoi-decision-id").is_none(),
+            "no decision was made, so no decision id header may appear"
+        );
+        let body = body_value(response).await;
+        assert!(
+            body["error"].get("explanation").is_none(),
+            "an error with no decision must not invent an explanation"
+        );
+    }
+
+    #[tokio::test]
+    async fn gateway_error_omits_explanation_when_decision_has_no_reasons() {
+        let decision = Decision {
+            id: Uuid::new_v4(),
+            request_id: RequestId("req-inline-174".to_string()),
+            action: DecisionAction::Deny,
+            selected_model: None,
+            selected_runtime: None,
+            selected_group: None,
+            background_model: None,
+            score: DecisionScore::default(),
+            explanation: Explanation {
+                summary: "denied".to_string(),
+                reasons: vec![],
+                rejected_options: vec![],
+            },
+            created_at: Utc::now(),
+        };
+
+        let response = gateway_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failure without reasons",
+            Some(&decision),
+        );
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let header_id = response
+            .headers()
+            .get("x-anemoi-decision-id")
+            .expect("decision id header")
+            .to_str()
+            .expect("ascii")
+            .to_string();
+        let body = body_value(response).await;
+        assert_eq!(
+            body["error"]["decision_id"].as_str().expect("decision_id"),
+            header_id,
+            "the decision id is still reported even without reasons"
+        );
+        assert!(
+            body["error"].get("explanation").is_none(),
+            "a decision with no reasons must not fabricate an explanation object"
+        );
+    }
+
     #[test]
     fn escalation_context_cache_roundtrips_then_consumes() {
         let cache = EscalationContextCache::default();
@@ -6723,21 +6825,30 @@ async fn list_models(State(state): State<AppState>) -> Json<ModelCatalog> {
 
 /// Builds an OpenAI-style structured error. When a decision was already made,
 /// its id is included in the body and echoed as `X-Anemoi-Decision-Id` so the
-/// caller can query `/explain/:id`.
+/// caller can query `/explain/:id`. When the decision carries reasons, the
+/// full structured explanation is embedded inline at `error.explanation` so
+/// the caller can act without a second HTTP call. A decision with no reasons
+/// omits the field entirely (never `null` or an empty object) so clients can
+/// test for the field's presence.
 fn gateway_error(
     status: StatusCode,
     message: impl Into<String>,
-    decision_id: Option<Uuid>,
+    decision: Option<&Decision>,
 ) -> Response {
-    let body = serde_json::json!({
-        "error": {
-            "message": message.into(),
-            "type": "anemoi_gateway_error",
-            "decision_id": decision_id.map(|id| id.to_string()),
-        }
+    let mut error = serde_json::json!({
+        "message": message.into(),
+        "type": "anemoi_gateway_error",
+        "decision_id": decision.map(|d| d.id.to_string()),
     });
+    if let Some(decision) = decision {
+        if !decision.explanation.reasons.is_empty() {
+            error["explanation"] = serde_json::to_value(&decision.explanation)
+                .expect("Explanation serializes infallibly");
+        }
+    }
+    let body = serde_json::json!({ "error": error });
     let mut response = (status, Json(body)).into_response();
-    if let Some(id) = decision_id {
+    if let Some(id) = decision.map(|d| d.id) {
         if let Ok(value) = HeaderValue::from_str(&id.to_string()) {
             response.headers_mut().insert("x-anemoi-decision-id", value);
         }
@@ -6919,7 +7030,7 @@ async fn chat_completions(
                 "no runnable model for domain `{domain}`: {}",
                 decision.explanation.summary
             ),
-            Some(decision.id),
+            Some(&decision),
         );
     };
 
@@ -6929,7 +7040,7 @@ async fn chat_completions(
         return gateway_error(
             StatusCode::FORBIDDEN,
             "forwarding to a non-mock runtime requires ANEMOI_ENABLE_LIVE_EXECUTE=1",
-            Some(decision.id),
+            Some(&decision),
         );
     }
 
@@ -6967,7 +7078,7 @@ async fn chat_completions(
             return gateway_error(
                 StatusCode::BAD_GATEWAY,
                 format!("runtime `{runtime_id}` has no base_url configured"),
-                Some(decision.id),
+                Some(&decision),
             );
         };
         match anemoi_runtime::forward_chat_completion(&target, &body).await {
@@ -6976,7 +7087,7 @@ async fn chat_completions(
                 return gateway_error(
                     StatusCode::BAD_GATEWAY,
                     format!("runtime forward failed: {error}"),
-                    Some(decision.id),
+                    Some(&decision),
                 )
             }
         }
@@ -7049,7 +7160,7 @@ fn gateway_stream_response(
         Err(error) => gateway_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             error.to_string(),
-            Some(decision.id),
+            Some(decision),
         ),
     }
 }
