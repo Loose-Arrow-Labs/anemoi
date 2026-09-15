@@ -3,11 +3,32 @@
 //! [`super::adapter::LlamaSwapAdapter`] so the byte-to-megabyte conversion,
 //! per-GPU summation, and comment handling are unit-testable without a network.
 
-use std::collections::BTreeSet;
+use std::collections::{hash_map::Entry, BTreeSet, HashMap};
 
 use anemoi_core::RuntimeMemorySnapshot;
 
 use crate::util::bytes_to_mb;
+
+/// The four metric names this snapshot consumes. Each maps to exactly one
+/// field of [`RuntimeMemorySnapshot`].
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum Metric {
+    RamTotal,
+    RamUsed,
+    VramTotal,
+    VramUsed,
+}
+
+/// One sample's identity: which metric, and — for the per-device GPU
+/// samples — which device. Host-RAM samples are unlabeled and carry no
+/// device.
+type SampleKey = (Metric, Option<String>);
+
+/// Every sample filed by pass one, keyed by [`SampleKey`]. The value is the
+/// sample's byte count, or `None` when the same key was filed more than once
+/// (a duplicate): the stored value no longer matters, because pass two
+/// blanks the whole pair a duplicated key belongs to.
+type SampleMap = HashMap<SampleKey, Option<u64>>;
 
 /// Parses llama-swap's Prometheus `/metrics` text into a
 /// [`RuntimeMemorySnapshot`] expressed in megabytes.
@@ -18,99 +39,44 @@ use crate::util::bytes_to_mb;
 /// - `llamaswap_gpu_memory_total_bytes` -> `vram_total_mb`
 /// - `llamaswap_gpu_memory_used_bytes`  -> `vram_used_mb`
 ///
-/// The host-RAM samples are unlabeled single values. The GPU samples carry a
-/// per-device label block (`{id="0",...}`); when more than one device reports,
-/// their values are **summed across every `id=`** rather than assuming
-/// `id="0"`. Because the GPU samples are per-device, the VRAM pair is complete
-/// only when the *same set of device ids* reported a usable total and a usable
-/// used sample: a device that reported one half but not the other would
-/// otherwise let the aggregate check pass with the full capacity of every
-/// card against the usage of a subset — a VRAM-pressure reading far lower
-/// than reality. When the two device sets differ, the whole VRAM pair reads
-/// `None` (unknown). A GPU sample whose `id` label is absent or unparseable
-/// joins no device: it is skipped entirely rather than being folded into
-/// another device's bucket. Lines beginning with `#` (HELP/TYPE) and any
-/// unrelated metric are ignored. A total/used pair is **all-or-nothing**: if
-/// either half is absent or was rejected as malformed, *both* fields of that
-/// pair read `None` (unknown) — never a total with no used, which would be
-/// mistaken for "0 MB used", a lie the scheduler would act on. The two pairs
-/// (VRAM, host RAM) are independent. Likewise, a per-GPU total whose
-/// cross-device sum overflows `u64` maps to `None` (unknown) rather than
-/// panicking, wrapping, or saturating.
+/// The parse runs in two passes. **Pass one, collect:** every line is parsed
+/// into a sample and filed in a map keyed by `(metric, device id)`. Nothing
+/// is accumulated. A line that fails to parse, or a GPU sample whose `id`
+/// label is absent or unparseable, never enters the map. If the same key is
+/// filed twice, the key is recorded as duplicated. **Pass two, decide:** with
+/// the whole scrape in hand, each pair is validated and, only if valid,
+/// aggregated:
+///
+/// - The host-RAM samples are unlabeled, so there is a single total and a
+///   single used. The RAM pair is known only when both are present and
+///   neither was duplicated.
+/// - The GPU samples are per-device. The VRAM pair is known only when the set
+///   of device ids with a valid total **exactly equals** the set with a valid
+///   used, and no key on either side was duplicated. A device that reported
+///   one half but not the other would otherwise let the aggregate check pass
+///   with the full capacity of every card against the usage of a subset — a
+///   VRAM-pressure reading far lower than reality. A duplicate sample for a
+///   metric and device id is the same trap in disguise: sets deduplicate
+///   while sums do not, so two totals for `id="0"` plus one used sample
+///   matches device sets yet doubles the total.
+///
+/// Per-device values are summed with checked arithmetic; an overflow of
+/// `u64` leaves that field `None` (unknown) rather than panicking, wrapping,
+/// or saturating. A total/used pair is **all-or-nothing**: if validation
+/// fails, *both* fields of that pair read `None` (unknown) — never a total
+/// with no used, which would be mistaken for "0 MB used", a lie the
+/// scheduler would act on. The two pairs (VRAM, host RAM) are independent: a
+/// broken VRAM pair never discards a valid RAM pair, and vice versa. Lines
+/// beginning with `#` (HELP/TYPE) and any unrelated metric are ignored.
 pub(crate) fn parse_llama_swap_memory_metrics(text: &str) -> RuntimeMemorySnapshot {
-    let mut ram_total_bytes: Option<u64> = None;
-    let mut ram_used_bytes: Option<u64> = None;
-    let mut vram_total_bytes: Option<u64> = None;
-    let mut vram_used_bytes: Option<u64> = None;
-    // Once a per-device sum overflows, the field reports unknown forever:
-    // the true total exceeds `u64::MAX`, so no later sample can repair it.
-    let mut vram_total_overflowed = false;
-    let mut vram_used_overflowed = false;
-    // The GPU samples are per-device: the pair is complete only when the
-    // same set of `id`s produced a usable total and a usable used. A sample
-    // without a parseable `id` label joins no set.
-    let mut vram_total_devices: BTreeSet<String> = BTreeSet::new();
-    let mut vram_used_devices: BTreeSet<String> = BTreeSet::new();
-
-    for raw in text.lines() {
-        let line = raw.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let Some((name, value_bytes, gpu_device_id)) = parse_sample_line(line) else {
-            continue;
-        };
-        match name {
-            "llamaswap_memory_total_bytes" => ram_total_bytes = Some(value_bytes),
-            "llamaswap_memory_used_bytes" => ram_used_bytes = Some(value_bytes),
-            // GPU samples are per-device; sum across every reported device.
-            // A sum that overflows `u64` leaves the field `None` (unknown)
-            // instead of panicking in debug or wrapping in release. A sample
-            // whose `id` label is absent or unparseable joins no device
-            // bucket and is skipped entirely: folding it into another
-            // device's bucket would attribute bytes that device never
-            // reported.
-            "llamaswap_gpu_memory_total_bytes" => {
-                if let Some(device_id) = gpu_device_id {
-                    add_gpu_sample(
-                        &mut vram_total_bytes,
-                        &mut vram_total_overflowed,
-                        value_bytes,
-                    );
-                    vram_total_devices.insert(device_id.to_owned());
-                }
-            }
-            "llamaswap_gpu_memory_used_bytes" => {
-                if let Some(device_id) = gpu_device_id {
-                    add_gpu_sample(&mut vram_used_bytes, &mut vram_used_overflowed, value_bytes);
-                    vram_used_devices.insert(device_id.to_owned());
-                }
-            }
-            _ => {}
-        }
-    }
-
-    // A total/used pair is all-or-nothing: if either half is absent or was
-    // rejected as malformed, both fields read `None` (unknown). A total with no
-    // used would otherwise reach pressure.rs as 0% used — a fabricated "empty
-    // runtime" the scheduler could act on. `None` means unknown and is handled
-    // safely; a fabricated zero is not. The two pairs are independent: a broken
-    // VRAM pair never discards a valid RAM pair, and vice versa.
-    //
-    // The GPU halves must also come from the *same devices*: a total summed
-    // over {0, 1} against a used summed over {0} would read as far lower VRAM
-    // pressure than reality and could push the scheduler into a cold load
-    // that does not fit. Differing device sets blank the whole VRAM pair.
-    let vram_devices_match = vram_total_devices == vram_used_devices;
-    let (vram_total_mb, vram_used_mb) =
-        match (vram_total_bytes, vram_used_bytes, vram_devices_match) {
-            (Some(total), Some(used), true) => (Some(bytes_to_mb(total)), Some(bytes_to_mb(used))),
-            _ => (None, None),
-        };
-    let (ram_total_mb, ram_used_mb) = match (ram_total_bytes, ram_used_bytes) {
-        (Some(total), Some(used)) => (Some(bytes_to_mb(total)), Some(bytes_to_mb(used))),
-        _ => (None, None),
-    };
+    // Pass one: file every parseable sample in a map keyed by
+    // (metric, device id), marking any key that appears more than once.
+    let samples = collect_samples(text);
+    // Pass two: validate each pair against the complete scrape, then
+    // aggregate. The pairs are decided independently: a broken VRAM pair
+    // never discards a valid RAM pair, and vice versa.
+    let (vram_total_mb, vram_used_mb) = vram_pair(&samples);
+    let (ram_total_mb, ram_used_mb) = ram_pair(&samples);
 
     RuntimeMemorySnapshot {
         vram_total_mb,
@@ -120,26 +86,155 @@ pub(crate) fn parse_llama_swap_memory_metrics(text: &str) -> RuntimeMemorySnapsh
     }
 }
 
-/// Accumulates one per-device GPU sample into the cross-device running
-/// total. The first sample starts the total; later samples add to it with
-/// checked arithmetic. If any addition would overflow `u64`, the field
-/// becomes `None` (unknown) and stays `None`: the true total exceeds
-/// `u64::MAX`, so no later sample can bring it back in range, and a debug
-/// panic or a release wrap would be a confidently-wrong number the scheduler
-/// would act on.
-fn add_gpu_sample(total: &mut Option<u64>, overflowed: &mut bool, value: u64) {
-    if *overflowed {
-        return;
-    }
-    match *total {
-        None => *total = Some(value),
-        Some(acc) => match acc.checked_add(value) {
-            Some(sum) => *total = Some(sum),
-            None => {
-                *total = None;
-                *overflowed = true;
+/// Pass one: walks the exposition text and files each recognized sample in a
+/// map keyed by `(metric, device id)`. Host-RAM samples are unlabeled and key
+/// on `device id = None`; GPU samples key on their `id` label. A sample that
+/// fails to parse, or a GPU sample with no usable `id` label, is skipped
+/// rather than filed — the sample joins no device bucket and cannot corrupt
+/// another device's figures. A key filed twice is marked as duplicated by
+/// replacing its value with `None`: pass two treats a marked key as "this
+/// pair is unknown", so the value never reaches a sum or a reported field.
+fn collect_samples(text: &str) -> SampleMap {
+    let mut samples: SampleMap = HashMap::new();
+
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((name, value_bytes, gpu_device_id)) = parse_sample_line(line) else {
+            continue;
+        };
+        let key = match name {
+            "llamaswap_memory_total_bytes" => (Metric::RamTotal, None),
+            "llamaswap_memory_used_bytes" => (Metric::RamUsed, None),
+            // GPU samples are per-device. A sample whose `id` label is absent
+            // or unparseable joins no device: it is skipped entirely rather
+            // than being folded into another device's bucket.
+            "llamaswap_gpu_memory_total_bytes" => match gpu_device_id {
+                Some(device_id) => (Metric::VramTotal, Some(device_id.to_owned())),
+                None => continue,
+            },
+            "llamaswap_gpu_memory_used_bytes" => match gpu_device_id {
+                Some(device_id) => (Metric::VramUsed, Some(device_id.to_owned())),
+                None => continue,
+            },
+            _ => continue,
+        };
+        // Filing the same key twice is a duplicate: mark it. Pass two
+        // treats a marked key as "this pair is unknown"; the `None` value
+        // never reaches a sum or a reported field.
+        match samples.entry(key) {
+            Entry::Vacant(vacant) => {
+                vacant.insert(Some(value_bytes));
             }
-        },
+            Entry::Occupied(mut occupied) => {
+                occupied.insert(None);
+            }
+        }
+    }
+
+    samples
+}
+
+/// Pass two, VRAM: validate and aggregate the per-device GPU samples.
+///
+/// Returns `(None, None)` unless both halves are sound: the set of device
+/// ids with a valid total exactly equals the set with a valid used, and no
+/// key on either side was duplicated. Only then are the per-device values
+/// summed with checked arithmetic — an overflow of `u64` again yields
+/// `None` (unknown).
+fn vram_pair(samples: &SampleMap) -> (Option<u64>, Option<u64>) {
+    // The device ids that reported a sample of the named half, derived from
+    // the collected map now that the whole scrape is in hand.
+    let devices_reporting = |metric: Metric| -> BTreeSet<String> {
+        samples
+            .iter()
+            .filter_map(|((sample_metric, device), _)| {
+                if *sample_metric == metric {
+                    device.clone()
+                } else {
+                    None
+                }
+            })
+            .collect()
+    };
+    let total_devices = devices_reporting(Metric::VramTotal);
+    let used_devices = devices_reporting(Metric::VramUsed);
+
+    // Differing device sets mean some device reported one half but not the
+    // other: a full total against a partial used reads far lower pressure
+    // than reality, so the whole pair is unknown.
+    if total_devices != used_devices {
+        return (None, None);
+    }
+    // A duplicated key (stored as `None`) means a device reported the same
+    // half twice: sets deduplicate but sums do not, so the second sample
+    // would inflate the total (or used) against the other half. Either half
+    // duplicated blanks the pair.
+    for ((sample_metric, device), value) in samples.iter() {
+        if value.is_none()
+            && device.is_some()
+            && (*sample_metric == Metric::VramTotal || *sample_metric == Metric::VramUsed)
+        {
+            return (None, None);
+        }
+    }
+
+    // Both halves are sound: sum each across devices.
+    match (
+        sum_metric_values(samples, Metric::VramTotal),
+        sum_metric_values(samples, Metric::VramUsed),
+    ) {
+        (Some(total), Some(used)) => (Some(bytes_to_mb(total)), Some(bytes_to_mb(used))),
+        _ => (None, None),
+    }
+}
+
+/// Sums every sample filed under `metric` with checked arithmetic. The first
+/// sample starts the sum; any addition that would overflow `u64` leaves the
+/// result `None` (unknown) instead of panicking in debug or wrapping in
+/// release — a wrap would be a confidently-wrong number the scheduler would
+/// act on. With no samples the sum is `None`, so an empty scrape still reads
+/// unknown, never a fabricated zero.
+fn sum_metric_values(samples: &SampleMap, metric: Metric) -> Option<u64> {
+    let mut total: Option<u64> = None;
+    for ((sample_metric, _), value) in samples.iter() {
+        if *sample_metric != metric {
+            continue;
+        }
+        // A duplicated key stores `None` rather than a byte count: the sum
+        // cannot be computed, so report unknown.
+        let bytes = (*value)?;
+        total = match total {
+            None => Some(bytes),
+            Some(acc) => acc.checked_add(bytes),
+        };
+        total?;
+    }
+    total
+}
+
+/// Pass two, host RAM: unlabeled, so there is exactly one total sample and
+/// one used sample. The pair is known only when both are present and neither
+/// key was duplicated; otherwise both fields read `None` (unknown). No
+/// summation is involved — a duplicate here is a second, contradictory
+/// reading of the same gauge, and keeping either half of a contradicted pair
+/// is guessing.
+fn ram_pair(samples: &SampleMap) -> (Option<u64>, Option<u64>) {
+    // A `None` value marks a duplicated key: a second, contradictory reading
+    // of the same unlabeled gauge. Neither half of a contradicted pair is
+    // trusted, so both fields read `None` (unknown).
+    let total = samples.get(&(Metric::RamTotal, None));
+    let used = samples.get(&(Metric::RamUsed, None));
+    if total.is_some_and(|t| t.is_none()) || used.is_some_and(|u| u.is_none()) {
+        return (None, None);
+    }
+    let total = total.copied().flatten();
+    let used = used.copied().flatten();
+    match (total, used) {
+        (Some(total), Some(used)) => (Some(bytes_to_mb(total)), Some(bytes_to_mb(used))),
+        _ => (None, None),
     }
 }
 
@@ -223,7 +318,7 @@ fn extract_label_value<'a>(block: &'a str, key: &str) -> Option<&'a str> {
         };
         if label_key.trim() != key {
             continue;
-        };
+        }
         let quoted = label_value.trim();
         let inner = quoted.strip_prefix('"')?.strip_suffix('"')?;
         if inner.is_empty() {
@@ -696,6 +791,86 @@ llamaswap_gpu_memory_used_bytes{id=\"0\"} 1073741824";
             snap.ram_used_mb,
             Some(512),
             "complete host-RAM pair survives an incomplete GPU pair"
+        );
+    }
+    /// The defect this rewrite fixes: two totals for `id="0"` and one used
+    /// for `id="0"`. Sets deduplicate while sums do not, so a set-equality
+    /// check alone sees {0} == {0} and a running sum sees 4 GiB against 1
+    /// GiB — a doubled total that reads 25% pressure instead of 50%. The
+    /// duplicated key blanks the whole pair: unknown, never the doubled
+    /// total against a single used.
+    #[test]
+    fn duplicate_gpu_total_blanks_the_pair_not_a_doubled_total() {
+        let text = "llamaswap_gpu_memory_total_bytes{id=\"0\"} 2147483648
+llamaswap_gpu_memory_total_bytes{id=\"0\"} 2147483648
+llamaswap_gpu_memory_used_bytes{id=\"0\"} 1073741824";
+
+        let snap = parse_llama_swap_memory_metrics(text);
+
+        assert_eq!(
+            snap.vram_total_mb, None,
+            "two totals for id=0: the duplicated key blanks the pair"
+        );
+        assert_eq!(
+            snap.vram_used_mb, None,
+            "the single used must not stand against a doubled total"
+        );
+        // Specifically not the doubled total (4096 MB) against the single
+        // used (1024 MB), which would read 25% pressure instead of 50%.
+        assert_ne!(snap.vram_total_mb, Some(4096));
+        assert_ne!(snap.vram_used_mb, Some(1024));
+    }
+
+    /// A duplicated host-RAM total is a second, contradictory reading of the
+    /// same unlabeled gauge: the pair is unknown, never the last-written
+    /// value standing against a used that was never contradicted.
+    #[test]
+    fn duplicate_host_ram_total_blanks_the_pair() {
+        let text = "llamaswap_memory_total_bytes 1073741824
+llamaswap_memory_total_bytes 2147483648
+llamaswap_memory_used_bytes 536870912";
+
+        let snap = parse_llama_swap_memory_metrics(text);
+
+        assert_eq!(
+            snap.ram_total_mb, None,
+            "duplicated total: neither reading is trusted"
+        );
+        assert_eq!(
+            snap.ram_used_mb, None,
+            "all-or-nothing: a contradicted pair blanks both fields"
+        );
+    }
+
+    /// The pairs stay independent even under duplication: a VRAM pair blanked
+    /// by a duplicated total must not discard a complete host-RAM pair.
+    #[test]
+    fn duplicate_vram_sample_leaves_valid_ram_pair_intact() {
+        let text = "llamaswap_memory_total_bytes 1073741824
+llamaswap_memory_used_bytes 536870912
+llamaswap_gpu_memory_total_bytes{id=\"0\"} 2147483648
+llamaswap_gpu_memory_total_bytes{id=\"0\"} 2147483648
+llamaswap_gpu_memory_used_bytes{id=\"0\"} 1073741824";
+
+        let snap = parse_llama_swap_memory_metrics(text);
+
+        assert_eq!(
+            snap.vram_total_mb, None,
+            "duplicated VRAM total: pair blanked"
+        );
+        assert_eq!(
+            snap.vram_used_mb, None,
+            "duplicated VRAM total: pair blanked"
+        );
+        assert_eq!(
+            snap.ram_total_mb,
+            Some(1024),
+            "complete host-RAM pair survives a duplicated VRAM sample"
+        );
+        assert_eq!(
+            snap.ram_used_mb,
+            Some(512),
+            "complete host-RAM pair survives a duplicated VRAM sample"
         );
     }
 }
