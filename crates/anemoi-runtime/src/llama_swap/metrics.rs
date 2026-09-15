@@ -20,10 +20,13 @@ use crate::util::bytes_to_mb;
 /// per-device label block (`{id="0",...}`); when more than one device reports,
 /// their values are **summed across every `id=`** rather than assuming
 /// `id="0"`. Lines beginning with `#` (HELP/TYPE) and any unrelated metric are
-/// ignored. A metric that is absent maps to `None` — never `Some(0)` — so a
-/// missing sample can't be mistaken for "0 MB used", a lie the scheduler would
-/// act on. Likewise, a per-GPU total whose cross-device sum overflows `u64`
-/// maps to `None` (unknown) rather than panicking, wrapping, or saturating.
+/// ignored. A total/used pair is **all-or-nothing**: if either half is absent
+/// or was rejected as malformed, *both* fields of that pair read `None`
+/// (unknown) — never a total with no used, which would be mistaken for "0 MB
+/// used", a lie the scheduler would act on. The two pairs (VRAM, host RAM) are
+/// independent. Likewise, a per-GPU total whose cross-device sum overflows
+/// `u64` maps to `None` (unknown) rather than panicking, wrapping, or
+/// saturating.
 pub(crate) fn parse_llama_swap_memory_metrics(text: &str) -> RuntimeMemorySnapshot {
     let mut ram_total_bytes: Option<u64> = None;
     let mut ram_used_bytes: Option<u64> = None;
@@ -62,11 +65,26 @@ pub(crate) fn parse_llama_swap_memory_metrics(text: &str) -> RuntimeMemorySnapsh
         }
     }
 
+    // A total/used pair is all-or-nothing: if either half is absent or was
+    // rejected as malformed, both fields read `None` (unknown). A total with no
+    // used would otherwise reach pressure.rs as 0% used — a fabricated "empty
+    // runtime" the scheduler could act on. `None` means unknown and is handled
+    // safely; a fabricated zero is not. The two pairs are independent: a broken
+    // VRAM pair never discards a valid RAM pair, and vice versa.
+    let (vram_total_mb, vram_used_mb) = match (vram_total_bytes, vram_used_bytes) {
+        (Some(total), Some(used)) => (Some(bytes_to_mb(total)), Some(bytes_to_mb(used))),
+        _ => (None, None),
+    };
+    let (ram_total_mb, ram_used_mb) = match (ram_total_bytes, ram_used_bytes) {
+        (Some(total), Some(used)) => (Some(bytes_to_mb(total)), Some(bytes_to_mb(used))),
+        _ => (None, None),
+    };
+
     RuntimeMemorySnapshot {
-        vram_total_mb: vram_total_bytes.map(bytes_to_mb),
-        vram_used_mb: vram_used_bytes.map(bytes_to_mb),
-        ram_total_mb: ram_total_bytes.map(bytes_to_mb),
-        ram_used_mb: ram_used_bytes.map(bytes_to_mb),
+        vram_total_mb,
+        vram_used_mb,
+        ram_total_mb,
+        ram_used_mb,
     }
 }
 
@@ -228,9 +246,14 @@ llamaswap_gpu_memory_total_bytes{id=\"1\"} 2147483648";
         assert_eq!(snap.ram_total_mb, None, "empty input: ram_total_mb");
         assert_eq!(snap.ram_used_mb, None, "empty input: ram_used_mb");
 
-        // Present metric must not leak `Some(0)` into absent fields.
+        // A lone total (no matching used) is an incomplete pair: the whole
+        // pair reads `None` — never a bare `Some(total)` with no used, which
+        // pressure.rs would read as 0% used, and never a leaked `Some(0)`.
         let snap = parse_llama_swap_memory_metrics("llamaswap_memory_total_bytes 104857600\n");
-        assert_eq!(snap.ram_total_mb, Some(100), "only ram_total present");
+        assert_eq!(
+            snap.ram_total_mb, None,
+            "lone total: incomplete pair is unknown"
+        );
         assert_eq!(snap.ram_used_mb, None, "ram_used absent");
         assert_eq!(snap.vram_total_mb, None, "vram_total absent");
         assert_eq!(snap.vram_used_mb, None, "vram_used absent");
@@ -243,34 +266,56 @@ llamaswap_gpu_memory_total_bytes{id=\"1\"} 2147483648";
 # TYPE llamaswap_memory_total_bytes gauge
 some_other_metric 42
 llamaswap_unrelated_metric 999
+llamaswap_memory_total_bytes 209715200
 llamaswap_memory_used_bytes 104857600";
 
         let snap = parse_llama_swap_memory_metrics(text);
 
+        // The complete RAM pair parses through the comments and unrelated
+        // lines; nothing spurious is invented.
         assert_eq!(
             snap.ram_used_mb,
             Some(100),
-            "unrelated lines do not disturb parsing"
+            "unrelated lines do not disturb a complete pair"
         );
-        assert_eq!(snap.ram_total_mb, None);
+        assert_eq!(
+            snap.ram_total_mb,
+            Some(200),
+            "unrelated lines do not disturb a complete pair"
+        );
         assert_eq!(snap.vram_total_mb, None);
         assert_eq!(snap.vram_used_mb, None);
     }
 
-    /// A malformed value is skipped rather than panicking; a well-formed
-    /// sample on another line is still parsed.
+    /// A malformed value is skipped rather than panicking; because the
+    /// malformed used leaves its pair incomplete, the whole RAM pair reads
+    /// `None`. A well-formed complete pair on other lines is still parsed.
     #[test]
     fn malformed_value_is_skipped_not_panicked() {
         let text = "llamaswap_memory_used_bytes not_a_number
-llamaswap_memory_total_bytes 104857600";
+llamaswap_memory_total_bytes 104857600
+llamaswap_gpu_memory_total_bytes{id=\"0\"} 2147483648
+llamaswap_gpu_memory_used_bytes{id=\"0\"} 1073741824";
 
         let snap = parse_llama_swap_memory_metrics(text);
 
-        assert_eq!(snap.ram_used_mb, None, "malformed sample is skipped");
         assert_eq!(
-            snap.ram_total_mb,
-            Some(100),
-            "well-formed sample still parsed"
+            snap.ram_used_mb, None,
+            "malformed sample is skipped, leaving the pair incomplete"
+        );
+        assert_eq!(
+            snap.ram_total_mb, None,
+            "incomplete RAM pair is unknown, not a bare total"
+        );
+        assert_eq!(
+            snap.vram_total_mb,
+            Some(2048),
+            "a well-formed complete pair on other lines still parses"
+        );
+        assert_eq!(
+            snap.vram_used_mb,
+            Some(1024),
+            "a well-formed complete pair on other lines still parses"
         );
     }
 
@@ -307,9 +352,10 @@ llamaswap_gpu_memory_total_bytes{id=\"0\"} 1.8446744073709552e+19";
     }
 
     /// Two GPU samples whose cross-device sum exceeds u64::MAX leave the
-    /// field `None` (unknown) rather than panicking (debug) or wrapping
-    /// (release). A later sample cannot undo the overflow, and the
-    /// independent used-bytes counter still sums normally.
+    /// total field `None` (unknown) rather than panicking (debug) or
+    /// wrapping (release). A later sample cannot undo the overflow. Because
+    /// a total/used pair is all-or-nothing, the overflowed total also blanks
+    /// the independently-summed used counter for that same pair.
     ///
     /// Values chosen: `18446744073709549568` is the largest `f64` strictly
     /// below 2^64 (f64 spacing there is 2^11), and `2048` (= 2^11) is the
@@ -331,9 +377,84 @@ llamaswap_gpu_memory_used_bytes{id=\"1\"} 1048576";
             "sum past u64::MAX is unknown: no panic, no wrap, no sticky repair"
         );
         assert_eq!(
-            snap.vram_used_mb,
-            Some(2),
-            "independent counter still sums across devices"
+            snap.vram_used_mb, None,
+            "all-or-nothing pair: the overflowed total also blanks the used counter"
         );
+    }
+
+    /// Defect 1: a present total with an absent used must blank the whole
+    /// pair, not leave a bare total that pressure.rs would read as 0% used.
+    #[test]
+    fn total_present_used_missing_blanks_whole_pair() {
+        let snap = parse_llama_swap_memory_metrics(
+            "llamaswap_gpu_memory_total_bytes{id=\"0\"} 2147483648",
+        );
+
+        assert_eq!(
+            snap.vram_total_mb, None,
+            "a total with no used must not stand alone"
+        );
+        assert_eq!(
+            snap.vram_used_mb, None,
+            "the pair is unknown, not a fabricated 0% used"
+        );
+    }
+
+    /// Defect 1: a malformed used is rejected; the pair is then incomplete,
+    /// so both VRAM fields read `None`.
+    #[test]
+    fn total_present_used_malformed_blanks_whole_pair() {
+        let snap = parse_llama_swap_memory_metrics(
+            "llamaswap_gpu_memory_total_bytes{id=\"0\"} 2147483648
+llamaswap_gpu_memory_used_bytes{id=\"0\"} not_a_number",
+        );
+
+        assert_eq!(
+            snap.vram_total_mb, None,
+            "malformed used leaves the pair incomplete"
+        );
+        assert_eq!(snap.vram_used_mb, None, "malformed used is rejected");
+    }
+
+    /// Defect 1: the two pairs are independent. A broken VRAM pair must not
+    /// discard a valid RAM pair, and vice versa.
+    #[test]
+    fn broken_vram_pair_leaves_valid_ram_pair_intact() {
+        let text = "llamaswap_gpu_memory_total_bytes{id=\"0\"} 2147483648
+llamaswap_memory_total_bytes 1073741824
+llamaswap_memory_used_bytes 536870912";
+
+        let snap = parse_llama_swap_memory_metrics(text);
+
+        // VRAM pair: total present, used absent -> both None.
+        assert_eq!(snap.vram_total_mb, None, "broken VRAM pair: total");
+        assert_eq!(snap.vram_used_mb, None, "broken VRAM pair: used");
+        // RAM pair: complete -> both parse, independent of the broken VRAM pair.
+        assert_eq!(
+            snap.ram_total_mb,
+            Some(1024),
+            "valid RAM pair survives a broken VRAM pair"
+        );
+        assert_eq!(
+            snap.ram_used_mb,
+            Some(512),
+            "valid RAM pair survives a broken VRAM pair"
+        );
+    }
+
+    /// Defect 1: fully valid input still parses to the same values as before.
+    #[test]
+    fn fully_valid_input_parses_to_same_values() {
+        let text = "llamaswap_memory_total_bytes 101195972608
+llamaswap_memory_used_bytes 59613642752
+llamaswap_gpu_memory_used_bytes{id=\"0\"} 2.0699938816e+10
+llamaswap_gpu_memory_total_bytes{id=\"0\"} 2.14695936e+10";
+
+        let snap = parse_llama_swap_memory_metrics(text);
+
+        assert_eq!(snap.ram_total_mb, Some(96508), "ram_total_mb");
+        assert_eq!(snap.ram_used_mb, Some(56852), "ram_used_mb");
+        assert_eq!(snap.vram_total_mb, Some(20475), "vram_total_mb");
+        assert_eq!(snap.vram_used_mb, Some(19741), "vram_used_mb");
     }
 }

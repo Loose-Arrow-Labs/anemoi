@@ -830,6 +830,67 @@ async fn llama_swap_timeout_returns_runtime_error() {
 }
 
 #[tokio::test]
+async fn llama_swap_metrics_probe_deadline_degrades_to_unknown_memory() {
+    // /health and /v1/models answer; /metrics accepts the connection but never
+    // responds. The probe deadline (150 ms) must fire, degrade memory to the
+    // empty/unknown snapshot, and — crucially — keep a healthy runtime
+    // available instead of surfacing an error that would hide it.
+    let server = spawn_hanging_metrics_server().await;
+    let adapter = LlamaSwapAdapter::new(RuntimeId("llama_swap".to_string()), &server.base_url)
+        .expect("adapter")
+        .with_metrics_probe_timeout(Duration::from_millis(150));
+
+    let snapshot = adapter
+        .inspect()
+        .await
+        .expect("a hanging /metrics must not make a healthy runtime error");
+
+    assert!(
+        snapshot.available,
+        "a hanging metrics endpoint must not make a healthy runtime look unavailable"
+    );
+    assert_eq!(
+        snapshot.memory,
+        RuntimeMemorySnapshot::default(),
+        "a probe that hits its deadline reports unknown memory, not fabricated values"
+    );
+}
+
+#[tokio::test]
+async fn llama_swap_metrics_probe_within_deadline_reports_memory() {
+    // Positive control for the deadline: a /metrics response that arrives well
+    // inside the (default, one-second) probe deadline is parsed and reported,
+    // proving the bound only degrades genuinely slow endpoints and does not
+    // over-bound a healthy one.
+    let server = spawn_fixture(vec![
+        http_response(200, "{}"),
+        http_response(200, r#"{"data":[]}"#),
+        http_response(
+            200,
+            "llamaswap_gpu_memory_total_bytes{id=\"0\"} 2147483648
+llamaswap_gpu_memory_used_bytes{id=\"0\"} 1073741824",
+        ),
+    ])
+    .await;
+    let adapter = LlamaSwapAdapter::new(RuntimeId("llama_swap".to_string()), &server.base_url)
+        .expect("adapter");
+
+    let snapshot = adapter.inspect().await.expect("snapshot");
+
+    assert!(snapshot.available);
+    assert_eq!(
+        snapshot.memory.vram_total_mb,
+        Some(2048),
+        "a /metrics response within the deadline is reported"
+    );
+    assert_eq!(
+        snapshot.memory.vram_used_mb,
+        Some(1024),
+        "a /metrics response within the deadline is reported"
+    );
+}
+
+#[tokio::test]
 async fn llama_swap_auth_header_is_applied_when_configured() {
     let server = spawn_fixture(vec![
         http_response(200, "{}"),
@@ -1186,6 +1247,65 @@ async fn spawn_timeout_server() -> String {
         tokio::time::sleep(Duration::from_secs(2)).await;
     });
     format!("http://{addr}")
+}
+
+/// A local fixture that answers the first two requests (`/health`, then
+/// `/v1/models`) with canned 200 responses, and then **hangs** on every
+/// subsequent request: it accepts the connection, reads the request, and never
+/// sends a response — modeling a wedged `/metrics` endpoint. Each answered
+/// connection is dropped (closed) so the client opens a fresh connection per
+/// request, matching [`spawn_fixture`]'s one-connection-per-request shape; the
+/// hung connection stays open (held across a long sleep) so the client sees a
+/// live connection that never answers.
+async fn spawn_hanging_metrics_server() -> TestServer {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let request_log = requests.clone();
+    let health = http_response(200, "{}");
+    let models = http_response(200, r#"{"data":[]}"#);
+
+    tokio::spawn(async move {
+        let mut connection_count = 0u32;
+        loop {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut buffer = vec![0; 4096];
+            let read = socket.read(&mut buffer).await.expect("read");
+            request_log
+                .lock()
+                .expect("requests")
+                .push(String::from_utf8_lossy(&buffer[..read]).to_string());
+            connection_count += 1;
+            match connection_count {
+                1 => {
+                    socket
+                        .write_all(health.as_bytes())
+                        .await
+                        .expect("write health");
+                }
+                2 => {
+                    socket
+                        .write_all(models.as_bytes())
+                        .await
+                        .expect("write models");
+                }
+                // 3rd connection (/metrics): read the request, then hang
+                // indefinitely — never send a response, like a wedged
+                // endpoint. The socket is held open across the sleep so the
+                // client observes a live connection that never answers.
+                _ => {
+                    // Hold the connection open across the sleep so the client
+                    // sees a live socket that never answers.
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                }
+            }
+        }
+    });
+
+    TestServer {
+        base_url: format!("http://{addr}"),
+        requests,
+    }
 }
 
 fn http_response(status: u16, body: &str) -> String {
