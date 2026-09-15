@@ -3,6 +3,8 @@
 //! [`super::adapter::LlamaSwapAdapter`] so the byte-to-megabyte conversion,
 //! per-GPU summation, and comment handling are unit-testable without a network.
 
+use std::collections::BTreeSet;
+
 use anemoi_core::RuntimeMemorySnapshot;
 
 use crate::util::bytes_to_mb;
@@ -19,14 +21,22 @@ use crate::util::bytes_to_mb;
 /// The host-RAM samples are unlabeled single values. The GPU samples carry a
 /// per-device label block (`{id="0",...}`); when more than one device reports,
 /// their values are **summed across every `id=`** rather than assuming
-/// `id="0"`. Lines beginning with `#` (HELP/TYPE) and any unrelated metric are
-/// ignored. A total/used pair is **all-or-nothing**: if either half is absent
-/// or was rejected as malformed, *both* fields of that pair read `None`
-/// (unknown) — never a total with no used, which would be mistaken for "0 MB
-/// used", a lie the scheduler would act on. The two pairs (VRAM, host RAM) are
-/// independent. Likewise, a per-GPU total whose cross-device sum overflows
-/// `u64` maps to `None` (unknown) rather than panicking, wrapping, or
-/// saturating.
+/// `id="0"`. Because the GPU samples are per-device, the VRAM pair is complete
+/// only when the *same set of device ids* reported a usable total and a usable
+/// used sample: a device that reported one half but not the other would
+/// otherwise let the aggregate check pass with the full capacity of every
+/// card against the usage of a subset — a VRAM-pressure reading far lower
+/// than reality. When the two device sets differ, the whole VRAM pair reads
+/// `None` (unknown). A GPU sample whose `id` label is absent or unparseable
+/// joins no device: it is skipped entirely rather than being folded into
+/// another device's bucket. Lines beginning with `#` (HELP/TYPE) and any
+/// unrelated metric are ignored. A total/used pair is **all-or-nothing**: if
+/// either half is absent or was rejected as malformed, *both* fields of that
+/// pair read `None` (unknown) — never a total with no used, which would be
+/// mistaken for "0 MB used", a lie the scheduler would act on. The two pairs
+/// (VRAM, host RAM) are independent. Likewise, a per-GPU total whose
+/// cross-device sum overflows `u64` maps to `None` (unknown) rather than
+/// panicking, wrapping, or saturating.
 pub(crate) fn parse_llama_swap_memory_metrics(text: &str) -> RuntimeMemorySnapshot {
     let mut ram_total_bytes: Option<u64> = None;
     let mut ram_used_bytes: Option<u64> = None;
@@ -36,13 +46,18 @@ pub(crate) fn parse_llama_swap_memory_metrics(text: &str) -> RuntimeMemorySnapsh
     // the true total exceeds `u64::MAX`, so no later sample can repair it.
     let mut vram_total_overflowed = false;
     let mut vram_used_overflowed = false;
+    // The GPU samples are per-device: the pair is complete only when the
+    // same set of `id`s produced a usable total and a usable used. A sample
+    // without a parseable `id` label joins no set.
+    let mut vram_total_devices: BTreeSet<String> = BTreeSet::new();
+    let mut vram_used_devices: BTreeSet<String> = BTreeSet::new();
 
     for raw in text.lines() {
         let line = raw.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let Some((name, value_bytes)) = parse_sample_line(line) else {
+        let Some((name, value_bytes, gpu_device_id)) = parse_sample_line(line) else {
             continue;
         };
         match name {
@@ -50,16 +65,26 @@ pub(crate) fn parse_llama_swap_memory_metrics(text: &str) -> RuntimeMemorySnapsh
             "llamaswap_memory_used_bytes" => ram_used_bytes = Some(value_bytes),
             // GPU samples are per-device; sum across every reported device.
             // A sum that overflows `u64` leaves the field `None` (unknown)
-            // instead of panicking in debug or wrapping in release.
+            // instead of panicking in debug or wrapping in release. A sample
+            // whose `id` label is absent or unparseable joins no device
+            // bucket and is skipped entirely: folding it into another
+            // device's bucket would attribute bytes that device never
+            // reported.
             "llamaswap_gpu_memory_total_bytes" => {
-                add_gpu_sample(
-                    &mut vram_total_bytes,
-                    &mut vram_total_overflowed,
-                    value_bytes,
-                );
+                if let Some(device_id) = gpu_device_id {
+                    add_gpu_sample(
+                        &mut vram_total_bytes,
+                        &mut vram_total_overflowed,
+                        value_bytes,
+                    );
+                    vram_total_devices.insert(device_id.to_owned());
+                }
             }
             "llamaswap_gpu_memory_used_bytes" => {
-                add_gpu_sample(&mut vram_used_bytes, &mut vram_used_overflowed, value_bytes);
+                if let Some(device_id) = gpu_device_id {
+                    add_gpu_sample(&mut vram_used_bytes, &mut vram_used_overflowed, value_bytes);
+                    vram_used_devices.insert(device_id.to_owned());
+                }
             }
             _ => {}
         }
@@ -71,10 +96,17 @@ pub(crate) fn parse_llama_swap_memory_metrics(text: &str) -> RuntimeMemorySnapsh
     // runtime" the scheduler could act on. `None` means unknown and is handled
     // safely; a fabricated zero is not. The two pairs are independent: a broken
     // VRAM pair never discards a valid RAM pair, and vice versa.
-    let (vram_total_mb, vram_used_mb) = match (vram_total_bytes, vram_used_bytes) {
-        (Some(total), Some(used)) => (Some(bytes_to_mb(total)), Some(bytes_to_mb(used))),
-        _ => (None, None),
-    };
+    //
+    // The GPU halves must also come from the *same devices*: a total summed
+    // over {0, 1} against a used summed over {0} would read as far lower VRAM
+    // pressure than reality and could push the scheduler into a cold load
+    // that does not fit. Differing device sets blank the whole VRAM pair.
+    let vram_devices_match = vram_total_devices == vram_used_devices;
+    let (vram_total_mb, vram_used_mb) =
+        match (vram_total_bytes, vram_used_bytes, vram_devices_match) {
+            (Some(total), Some(used), true) => (Some(bytes_to_mb(total)), Some(bytes_to_mb(used))),
+            _ => (None, None),
+        };
     let (ram_total_mb, ram_used_mb) = match (ram_total_bytes, ram_used_bytes) {
         (Some(total), Some(used)) => (Some(bytes_to_mb(total)), Some(bytes_to_mb(used))),
         _ => (None, None),
@@ -116,9 +148,13 @@ fn add_gpu_sample(total: &mut Option<u64>, overflowed: &mut bool, value: u64) {
 /// failing, so samples at or above it must be rejected before the cast.
 const TWO_POW_64: f64 = 18_446_744_073_709_551_616.0;
 
-/// Extracts the metric name and byte value from one Prometheus exposition line,
-/// returning `None` when the line is not a readable `<name>{labels} value`
-/// sample (the caller skips such lines).
+/// Extracts the metric name, byte value, and — for labeled samples — the
+/// `id` label, from one Prometheus exposition line, returning `None` when the
+/// line is not a readable `<name>{labels} value` sample (the caller skips
+/// such lines). The third element is `Some` only when the label block
+/// contains a parseable, non-empty `id` label; samples without one carry
+/// `None`, and it is the caller's responsibility to keep unlabeled host-RAM
+/// samples while rejecting GPU samples.
 ///
 /// The value is parsed as `f64` so scientific-notation samples
 /// (e.g. `2.0699938816e+10`) survive — a `u64`-only parse would silently drop
@@ -127,7 +163,7 @@ const TWO_POW_64: f64 = 18_446_744_073_709_551_616.0;
 /// fractional values (the cast would truncate rather than represent them
 /// exactly), and any value at or above 2^64 (`f64 as u64` saturates those to
 /// `u64::MAX` — fabricated capacity is worse than a missing one).
-fn parse_sample_line(line: &str) -> Option<(&str, u64)> {
+fn parse_sample_line(line: &str) -> Option<(&str, u64, Option<&str>)> {
     // A Prometheus metric name runs from the start of the line to the first `{`
     // or whitespace and contains neither.
     let name_end = line
@@ -138,12 +174,20 @@ fn parse_sample_line(line: &str) -> Option<(&str, u64)> {
         return None;
     }
     let rest = line.get(name_end..)?.trim_start();
-    // Drop the label block, if present. Label values may contain spaces and
-    // braces, so the closing `}` is located while respecting double quotes.
-    let after_labels = match rest.strip_prefix('{') {
-        Some(tail) => tail.get(find_label_block_end(tail)? + 1..)?.trim_start(),
-        None => rest,
+    // Locate the label block, if present. Label values may contain spaces and
+    // braces, so the closing `}` is found while respecting double quotes; an
+    // unterminated block rejects the line.
+    let (after_labels, label_block) = match rest.strip_prefix('{') {
+        Some(tail) => {
+            let end = find_label_block_end(tail)?;
+            (tail.get(end + 1..)?.trim_start(), Some(&tail[..end]))
+        }
+        None => (rest, None),
     };
+    // The device identity: the value of the `id` label, when present and
+    // non-empty. No parseable id means the sample cannot be attributed to a
+    // device.
+    let device_id = label_block.and_then(|block| extract_label_value(block, "id"));
     // The value is the first token after the label block; a trailing timestamp
     // (when present) is the next token and is ignored.
     let value = after_labels
@@ -160,7 +204,34 @@ fn parse_sample_line(line: &str) -> Option<(&str, u64)> {
     }
     // In range: the cast to `u64` is exact (integer-valued, < 2^64), so no
     // truncation or saturation can occur here.
-    Some((name, value as u64))
+    Some((name, value as u64, device_id))
+}
+
+/// Returns the text of the double-quoted value of the named label within a
+/// Prometheus label block (the text between the outer `{` and `}`), or `None`
+/// when the block has no such label or its value is empty. Labels are
+/// `key="value"` pairs separated by `,`; a value may itself contain spaces
+/// and `}`. No unescaping is attempted: a literal quote inside a value would
+/// have to appear as `\"` in exposition form, and treating that backslash-
+/// quoted quote as a terminator leaves the label unparseable — the
+/// "reject, do not guess" outcome, never a misattribution to another device.
+fn extract_label_value<'a>(block: &'a str, key: &str) -> Option<&'a str> {
+    for part in block.split(',') {
+        let part = part.trim();
+        let Some((label_key, label_value)) = part.split_once('=') else {
+            continue;
+        };
+        if label_key.trim() != key {
+            continue;
+        };
+        let quoted = label_value.trim();
+        let inner = quoted.strip_prefix('"')?.strip_suffix('"')?;
+        if inner.is_empty() {
+            return None;
+        }
+        return Some(inner);
+    }
+    None
 }
 
 /// Byte index of the closing `}` of a Prometheus label block, respecting
@@ -456,5 +527,175 @@ llamaswap_gpu_memory_total_bytes{id=\"0\"} 2.14695936e+10";
         assert_eq!(snap.ram_used_mb, Some(56852), "ram_used_mb");
         assert_eq!(snap.vram_total_mb, Some(20475), "vram_total_mb");
         assert_eq!(snap.vram_used_mb, Some(19741), "vram_used_mb");
+    }
+
+    /// Per-device pairing: two devices, both halves present for each. The
+    /// total and used sets are identical ({"0","1"}), so both sums pass and
+    /// aggregate across devices exactly as before this fix.
+    #[test]
+    fn two_devices_both_halves_present_sum_across_devices() {
+        let text = "llamaswap_gpu_memory_total_bytes{id=\"0\"} 2147483648
+llamaswap_gpu_memory_total_bytes{id=\"1\"} 2147483648
+llamaswap_gpu_memory_used_bytes{id=\"0\"} 1073741824
+llamaswap_gpu_memory_used_bytes{id=\"1\"} 1073741824";
+
+        let snap = parse_llama_swap_memory_metrics(text);
+
+        // 2 GiB + 2 GiB = 4096 MB total; 1 GiB + 1 GiB = 2048 MB used.
+        assert_eq!(
+            snap.vram_total_mb,
+            Some(4096),
+            "both devices complete: totals sum across devices"
+        );
+        assert_eq!(
+            snap.vram_used_mb,
+            Some(2048),
+            "both devices complete: used sums across devices"
+        );
+    }
+
+    /// The defect: two devices, device 1's used sample missing. Previously the
+    /// aggregate check saw total = 4 GiB (both devices) and used = 1 GiB
+    /// (device 0 only), both `Some`, and reported the full capacity of both
+    /// cards against the usage of one — 25% pressure where reality is 50% on
+    /// the only card whose usage is even known. Now the total set {"0","1"}
+    /// differs from the used set {"0"}, so the whole VRAM pair reads `None`:
+    /// unknown, never a full total against a partial used.
+    #[test]
+    fn device_missing_used_blanks_the_pair_not_partial_used() {
+        let text = "llamaswap_gpu_memory_total_bytes{id=\"0\"} 2147483648
+llamaswap_gpu_memory_total_bytes{id=\"1\"} 2147483648
+llamaswap_gpu_memory_used_bytes{id=\"0\"} 1073741824";
+
+        let snap = parse_llama_swap_memory_metrics(text);
+
+        assert_eq!(
+            snap.vram_total_mb, None,
+            "device 1 reported a total but no used: the total and used device sets \
+             differ, so the whole pair is unknown — never 4096 MB total against \
+             1024 MB used, which reads 25% pressure instead of 50%"
+        );
+        assert_eq!(
+            snap.vram_used_mb, None,
+            "the partial used (device 0 only) must not stand against the full total"
+        );
+    }
+
+    /// Same as the missing case, but device 1's used sample is malformed
+    /// (`not_a_number`): the line is skipped, so again only device 0 is in the
+    /// used set while both devices are in the total set, and the pair blanks.
+    #[test]
+    fn device_malformed_used_blanks_the_pair() {
+        let text = "llamaswap_gpu_memory_total_bytes{id=\"0\"} 2147483648
+llamaswap_gpu_memory_total_bytes{id=\"1\"} 2147483648
+llamaswap_gpu_memory_used_bytes{id=\"0\"} 1073741824
+llamaswap_gpu_memory_used_bytes{id=\"1\"} not_a_number";
+
+        let snap = parse_llama_swap_memory_metrics(text);
+
+        assert_eq!(
+            snap.vram_total_mb, None,
+            "malformed device-1 used is rejected, so the total and used device sets \
+             differ and the pair is unknown — never the full total against one \
+             device's used"
+        );
+        assert_eq!(
+            snap.vram_used_mb, None,
+            "a partial used set must not stand against the full total set"
+        );
+    }
+
+    /// A GPU sample whose `id` label is absent joins no device bucket: it is
+    /// skipped entirely, so it cannot corrupt the other device's figures.
+    /// Here device 0 reports both halves and the unlabeled total is discarded
+    /// — device 0's numbers come through unchanged.
+    #[test]
+    fn gpu_sample_without_id_label_joins_no_device() {
+        let text = "llamaswap_gpu_memory_total_bytes 999999999
+llamaswap_gpu_memory_total_bytes{id=\"0\"} 2147483648
+llamaswap_gpu_memory_used_bytes{id=\"0\"} 1073741824";
+
+        let snap = parse_llama_swap_memory_metrics(text);
+
+        assert_eq!(
+            snap.vram_total_mb,
+            Some(2048),
+            "unlabeled GPU total joins no device bucket; device 0's total stands alone"
+        );
+        assert_eq!(
+            snap.vram_used_mb,
+            Some(1024),
+            "device 0's used is untouched by the unlabeled sample"
+        );
+
+        // Same, with the unlabeled sample on the used side.
+        let text = "llamaswap_gpu_memory_total_bytes{id=\"0\"} 2147483648
+llamaswap_gpu_memory_used_bytes 999999999
+llamaswap_gpu_memory_used_bytes{id=\"0\"} 1073741824";
+
+        let snap = parse_llama_swap_memory_metrics(text);
+
+        assert_eq!(
+            snap.vram_total_mb,
+            Some(2048),
+            "unlabeled GPU used joins no device bucket; device 0's total stands alone"
+        );
+        assert_eq!(
+            snap.vram_used_mb,
+            Some(1024),
+            "device 0's used is untouched by the unlabeled sample"
+        );
+    }
+
+    /// Single device with both halves present: unchanged from today's
+    /// behavior — the pair parses to exactly the reported values.
+    #[test]
+    fn single_device_both_halves_unchanged() {
+        let text = "llamaswap_gpu_memory_used_bytes{id=\"0\"} 2.0699938816e+10
+llamaswap_gpu_memory_total_bytes{id=\"0\"} 2.14695936e+10";
+
+        let snap = parse_llama_swap_memory_metrics(text);
+
+        assert_eq!(
+            snap.vram_used_mb,
+            Some(19741),
+            "single complete device: used unchanged from pre-fix behavior"
+        );
+        assert_eq!(
+            snap.vram_total_mb,
+            Some(20475),
+            "single complete device: total unchanged from pre-fix behavior"
+        );
+    }
+
+    /// The pairs are independent at every level: a VRAM pair broken by a
+    /// missing device half must not discard a complete host-RAM pair.
+    #[test]
+    fn incomplete_gpu_pair_leaves_host_ram_pair_intact() {
+        let text = "llamaswap_memory_total_bytes 1073741824
+llamaswap_memory_used_bytes 536870912
+llamaswap_gpu_memory_total_bytes{id=\"0\"} 2147483648
+llamaswap_gpu_memory_total_bytes{id=\"1\"} 2147483648
+llamaswap_gpu_memory_used_bytes{id=\"0\"} 1073741824";
+
+        let snap = parse_llama_swap_memory_metrics(text);
+
+        // VRAM: total set {0,1} vs used set {0} -> pair blanked.
+        assert_eq!(
+            snap.vram_total_mb, None,
+            "device-mismatched VRAM pair: total"
+        );
+        assert_eq!(snap.vram_used_mb, None, "device-mismatched VRAM pair: used");
+        // RAM: unlabeled, complete -> parses independently of the broken VRAM.
+        assert_eq!(
+            snap.ram_total_mb,
+            Some(1024),
+            "complete host-RAM pair survives an incomplete GPU pair"
+        );
+        assert_eq!(
+            snap.ram_used_mb,
+            Some(512),
+            "complete host-RAM pair survives an incomplete GPU pair"
+        );
     }
 }
