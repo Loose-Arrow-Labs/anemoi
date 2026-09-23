@@ -2,6 +2,10 @@
 
 The Anemoi Inference Gateway (added in issue #34) provides an OpenAI-compatible endpoint that intelligently selects which model to use for each request.
 
+Gateway mock forwarding is operational. Live forwarding, quality-floor
+escalation, and DNS exposure have caveats; see
+[Known Limitations](LIMITATIONS.md).
+
 ## What is the Inference Gateway?
 
 Instead of:
@@ -232,6 +236,40 @@ The gateway supports all standard OpenAI parameters:
 
 **Note**: Not all parameters are supported by all underlying runtimes. Unsupported parameters are silently ignored.
 
+### Anemoi Selection Metadata
+
+Clients can include a private `anemoi` object to describe scheduling needs. The
+gateway uses this metadata for the Anemoi decision and strips it before
+forwarding the request to the selected runtime.
+
+```json
+{
+  "model": "coding",
+  "messages": [{"role": "user", "content": "Plan this migration"}],
+  "max_tokens": 1024,
+  "anemoi": {
+    "quality_floor": { "minimum_parameter_class": "32b" },
+    "latency_budget_ms": 2000,
+    "escalation_intent": {
+      "task_type": "planning",
+      "context": "small model handled setup; escalate for architecture work"
+    }
+  }
+}
+```
+
+`quality_floor.minimum_parameter_class` is a hard floor for normal selection.
+For example, a `32b` request cannot be silently satisfied by a `9b` model. If a
+qualifying larger model exists but would cold-load beyond the latency budget,
+continuity policy may select a hot smaller worker immediately while staging the
+qualifying model in the background. If no qualifying model is configured for the
+domain, Anemoi denies the request instead of pretending the smaller model met
+the floor.
+
+Live background staging still respects the daemon safety gate:
+`ANEMOI_ENABLE_LIVE_EXECUTE=1` is required before Anemoi asks a runtime to load
+models.
+
 ---
 
 ## Response Telemetry
@@ -262,6 +300,17 @@ What anemoi did with your request:
 | `forward-to-runtime` | Request forwarded to actual runtime (live) |
 | `mock-forward` | Request simulated (testing mode) |
 | `decision-only` | Decision made but not executed |
+
+### The gateway forwards; `/execute` does not
+
+`/v1/chat/completions` is the surface that **actually forwards inference** to the
+selected runtime. `POST /execute` is a related but different endpoint: it runs
+the same decision and returns an **action-plan / model-load handoff**, and always
+reports `handoff.full_inference_forwarded: false` — it never forwards the user's
+inference to the model itself. Use `/v1/chat/completions` for real inference;
+use `/execute` when you want the decision plus the load/staging plan. See
+[Known Limitations](LIMITATIONS.md) for the readiness status of the
+escalation/handoff flow.
 
 ---
 

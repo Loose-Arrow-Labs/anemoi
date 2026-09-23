@@ -15,6 +15,7 @@ domains:
   coding:
     rosters:
       - fast_coding
+      - large_coding
   coding-full:
     live_roster: llama_swap
 
@@ -26,6 +27,13 @@ residency_groups:
     models:
       - qwen3.5-9b-mtp
       - qwen3.5-4b-mtp
+    allow_background_load: true
+  large_coding:
+    purpose:
+      - coding
+      - escalation
+    models:
+      - qwen3.6-35b-a3b-mtp
     allow_background_load: true
 
 models:
@@ -42,6 +50,14 @@ models:
     parameter_class: 4b
     context_window: 262144
     cold_load_estimate_ms: 20000
+    supported_runtimes:
+      - llama_swap
+    supports_streaming: true
+  qwen3.6-35b-a3b-mtp:
+    family: qwen
+    parameter_class: 35b
+    context_window: 32768
+    cold_load_estimate_ms: 45000
     supported_runtimes:
       - llama_swap
     supports_streaming: true

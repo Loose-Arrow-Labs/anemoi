@@ -6,13 +6,9 @@ gateway, runtime, agent framework, or application platform.
 
 ## Current Repository State
 
-As of 2026-05-24, this checkout contains both:
-
-- an active Rust workspace under `crates/anemoi-*`
-- legacy `.NET`/C# files under `src/Anemoi.*` plus `Anemoi.sln`
-
-Treat the legacy .NET surface as `Needs validation`. Do not delete, rename, or
-migrate it unless the task explicitly scopes that work.
+As of 2026-06-09, Anemoi's active product surface is the Rust workspace under
+`crates/anemoi-*`. The older parallel service surface has been removed; do not
+reintroduce a second product stack without an explicit architecture issue.
 
 ## Ground Rules
 
@@ -138,14 +134,13 @@ Suggested scopes:
 - `config`
 - `docs`
 - `repo`
-- `legacy`
 
 Examples:
 
 ```text
 feat(policy): stage large model behind hot worker
 fix(runtime): normalize ollama resident model names
-docs(repo): document legacy dotnet surface
+docs(repo): clarify repository surface
 ```
 
 ## Pull Requests
@@ -167,8 +162,7 @@ Stop and ask for direction when:
 
 - a task would turn Anemoi into an inference runtime
 - a task would introduce provider-gateway behavior before core policy works
-- a change requires deleting or migrating legacy .NET files without explicit
-  scope
+- a change would reintroduce a second product stack without explicit scope
 - runtime behavior is ambiguous and would change product semantics
 - validation fails outside the task scope
 - live runtime changes would be required but were not explicitly requested

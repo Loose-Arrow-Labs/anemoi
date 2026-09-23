@@ -2,6 +2,9 @@
 
 Welcome to Anemoi! This guide walks you through using Anemoi for the first time, whether you're an end user or an operator.
 
+Before relying on a live runtime or LAN/DNS deployment, review
+[Known Limitations](LIMITATIONS.md).
+
 ## Table of Contents
 
 1. [For End Users (Pi / OpenCode)](#for-end-users)
@@ -9,6 +12,7 @@ Welcome to Anemoi! This guide walks you through using Anemoi for the first time,
 3. [Architecture Overview](#architecture-overview)
 4. [Common Tasks](#common-tasks)
 5. [Troubleshooting](#troubleshooting)
+6. [Known Limitations](LIMITATIONS.md)
 
 ---
 

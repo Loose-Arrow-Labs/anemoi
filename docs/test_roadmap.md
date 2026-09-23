@@ -1,13 +1,13 @@
 # Anemoi Test Roadmap
 
-**Current Status**: **31/31 Prompts Complete and Passing**
+**Current Status**: **31/31 Prompts Complete and Passing** (prompt 32 Pending)
 
 This roadmap keeps the Rust rewrite prompt-aligned. Later scaffolding can exist,
 but a prompt is not accepted until its tests prove the contract named here.
 
 ## Summary (2026-06-01)
 
-All core features are complete and production-ready:
+Core features are implemented and their prompt tests pass. Overall status is **Beta**: the mock demo path and the OpenAI-compatible gateway are operational, but live-runtime, Docker/DNS, and escalation/handoff readiness are tracked in [Known Limitations](LIMITATIONS.md).
 - **Prompts 00-31**: All passing with required tests
 - **Issues #30-34**: All merged to main with full integration
 - **Issue #77**: Gateway request shape now reaches policy as selection signals
@@ -71,6 +71,7 @@ hardening when the local toolchain has the `clippy` component installed.
 | 29 llama-swap residency events | Live `/api/events` SSE stream feeds observed model state into `inspect()` residents and drives staging completion without polling or false residency. | `anemoi-runtime`, `anemoi-daemon` | Passing |
 | 30 gateway selection signals | Gateway chat requests carry prompt/output estimates and explicit Anemoi metadata into policy, and policy enforces known context-window fit. | `anemoi-daemon`, `anemoi-policy` | Passing |
 | 31 concurrent transition coordination | Concurrent/multi-instance residency transition collisions are arbitrated deterministically (join, deterministic winner, hot fallback, gated staging, expired-owner take-over, runtime-unavailable) with code-enforced lease/fencing and a structured explanation. | `anemoi-policy`, `anemoi-core` | Passing |
+| 32 displacement-aware routing | Selecting a candidate that would evict a resident model carries an explicit scored `displacement` penalty, fed by the runtime's declared eviction weights and weighted harder for keep-hot/pinned groups, and named in the explanation. | `anemoi-policy`, `anemoi-core`, `anemoi-runtime` | Pending |
 
 ## Current Focus
 
@@ -249,7 +250,7 @@ Prompt 14 passed with:
 - local binding defaults documented
 - optional JSONL decision log documented
 - `/execute` v1 limitation documented
-- legacy .NET surface marked `Needs validation`
+- repository surface documented as Rust-first
 - final validation passed
 
 Prompt 15 passed with:
