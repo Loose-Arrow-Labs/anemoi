@@ -51,16 +51,14 @@ Runtimes execute. Anemoi decides.
 
 ## 3. Current Repository State
 
-Repository evidence as of 2026-05-24:
+Repository evidence as of 2026-06-09:
 
 - The active Rust workspace is defined in `Cargo.toml`.
 - Rust crates live under `crates/anemoi-*`.
 - The example Anemoi policy config is `config/anemoi.example.yaml`.
-- `src/Anemoi.*` and `Anemoi.sln` are legacy C#/.NET project files still
-  present in this checkout.
-- Treat the legacy .NET surface as `Needs validation` unless a task explicitly
-  scopes migration, deletion, or compatibility work.
-- Do not delete or rename legacy files as incidental cleanup.
+- The repository is Rust-only; the former managed-code surface was removed as
+  explicit cleanup under issue #129.
+- Do not reintroduce a parallel non-Rust product surface as incidental work.
 
 ---
 
@@ -309,7 +307,6 @@ Each task must build understanding from:
 - `config/anemoi.example.yaml`
 - relevant crate source
 - current working tree state
-- legacy `.NET` files when the task touches migration or cleanup
 
 Use repository evidence over assumptions. Use `TBD`, `Unknown`, or `Needs
 validation` instead of guessing.
@@ -335,7 +332,7 @@ Do not:
 - hide scheduling reasons
 - make policy scoring probabilistic in core v1
 - duplicate scheduling logic across API, CLI, and policy crates
-- erase legacy files without an explicit migration task
+- reintroduce retired product surfaces without an explicit architecture task
 - weaken local-first or security constraints
 - claim a runtime adapter is complete because a mock test passed
 
