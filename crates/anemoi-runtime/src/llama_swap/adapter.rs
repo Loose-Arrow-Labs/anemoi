@@ -17,6 +17,20 @@ use super::event_stream::{
     residents_from_states, run_event_stream, LlamaSwapEventStream, ModelStateCache,
 };
 use super::matrix::LlamaSwapMatrixConfig;
+use super::metrics::parse_llama_swap_memory_metrics;
+
+/// Deadline for the optional `/metrics` probe inside [`LlamaSwapAdapter::inspect`].
+///
+/// The daemon's reconciliation snapshot TTL is `DEFAULT_RECONCILIATION_TTL_MS`
+/// (5000 ms) and its tick interval is half that (2500 ms), with adapters
+/// inspected **serially** in a single loop. The `/metrics` fetch is optional —
+/// it degrades to an empty snapshot on failure — so it must not be allowed to
+/// burn the whole TTL (which would go stale) or the whole tick (which would
+/// delay every runtime later in the loop), on every tick. One second sits well
+/// below the 2500 ms tick interval, leaving headroom for the `/health` and
+/// `/v1/models` probes plus the remaining runtimes. This bounds the probe
+/// independently of the adapter's general request timeout, which is 5 s.
+const METRICS_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone)]
 pub struct LlamaSwapAdapter {
@@ -33,6 +47,11 @@ pub struct LlamaSwapAdapter {
     /// matrix awareness is disabled and [`LlamaSwapAdapter::can_colocate`]
     /// conservatively reports that no two models are known to colocate.
     matrix: Option<LlamaSwapMatrixConfig>,
+    /// Deadline for the optional `/metrics` probe; see
+    /// [`METRICS_PROBE_TIMEOUT`]. Defaults to that constant; settable so the
+    /// deadline can be exercised at a short interval in tests without waiting a
+    /// full second.
+    metrics_probe_timeout: Duration,
 }
 
 impl LlamaSwapAdapter {
@@ -52,11 +71,21 @@ impl LlamaSwapAdapter {
             auth_token: None,
             model_states: Arc::new(RwLock::new(HashMap::new())),
             matrix: None,
+            metrics_probe_timeout: METRICS_PROBE_TIMEOUT,
         })
     }
 
     pub fn with_bearer_token(mut self, token: impl Into<String>) -> Self {
         self.auth_token = Some(token.into());
+        self
+    }
+
+    /// Overrides the deadline for the optional `/metrics` probe. The
+    /// production default is [`METRICS_PROBE_TIMEOUT`]; tests set a short
+    /// interval so a hanging metrics endpoint can be exercised without waiting
+    /// a full second.
+    pub fn with_metrics_probe_timeout(mut self, timeout: Duration) -> Self {
+        self.metrics_probe_timeout = timeout;
         self
     }
 
@@ -154,6 +183,28 @@ impl LlamaSwapAdapter {
             .collect())
     }
 
+    /// Fetches and parses llama-swap's Prometheus `/metrics` endpoint into a
+    /// [`RuntimeMemorySnapshot`] (VRAM and host RAM in MB). Returns a
+    /// [`RuntimeError`] when the endpoint is unreachable or returns a non-2xx
+    /// status; the caller decides how to degrade (typically to an empty
+    /// snapshot so every field reads `None`/unknown).
+    async fn inspect_memory(&self) -> Result<RuntimeMemorySnapshot, RuntimeError> {
+        let url = self
+            .base_url
+            .join("/metrics")
+            .map_err(|error| RuntimeError::Url(error.to_string()))?;
+        let body = self
+            .client
+            .get(url)
+            .headers(self.headers()?)
+            .send()
+            .await?
+            .error_for_status()?
+            .text()
+            .await?;
+        Ok(parse_llama_swap_memory_metrics(&body))
+    }
+
     fn headers(&self) -> Result<HeaderMap, RuntimeError> {
         let mut headers = HeaderMap::new();
         if let Some(token) = &self.auth_token {
@@ -226,6 +277,30 @@ impl RuntimeAdapter for LlamaSwapAdapter {
             residents_from_states(&states)
         };
 
+        // llama-swap serves Prometheus memory metrics at `/metrics`. A metrics
+        // failure (endpoint absent, 5xx, timeout) must not make a healthy
+        // runtime look unavailable nor lie about memory: fall back to the empty
+        // snapshot so every field reads `None` (unknown), never `Some(0)`.
+        let memory =
+            match tokio::time::timeout(self.metrics_probe_timeout, self.inspect_memory()).await {
+                Ok(result) => result.unwrap_or_else(|error| {
+                    tracing::warn!(
+                        runtime = %self.id,
+                        %error,
+                        "memory metrics fetch failed after a healthy /health probe; reporting unknown memory"
+                    );
+                    RuntimeMemorySnapshot::default()
+                }),
+                Err(_elapsed) => {
+                    tracing::warn!(
+                        runtime = %self.id,
+                        timeout_ms = self.metrics_probe_timeout.as_millis(),
+                        "memory metrics probe exceeded its deadline; reporting unknown memory"
+                    );
+                    RuntimeMemorySnapshot::default()
+                }
+            };
+
         Ok(RuntimeSnapshot {
             runtime_id: self.id.clone(),
             available: true,
@@ -235,7 +310,7 @@ impl RuntimeAdapter for LlamaSwapAdapter {
             // docs/live_validation/residency-truth-contract.md.
             residents,
             configured_models,
-            memory: RuntimeMemorySnapshot::default(),
+            memory,
             active_requests: Vec::new(),
             colocation: self.colocation_constraints(),
         })
