@@ -339,7 +339,7 @@ runtimes:
   llama_swap:
     adapter: llama_swap
     base_url: "http://localhost:8085"
-    auth_token: "LOCAL"
+    auth_token: "test-key"
 "#,
         )
         .expect("config");

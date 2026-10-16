@@ -2,7 +2,7 @@
 #
 # Set before running:
 #   export ANEMOI_LLAMA_SWAP_BASE_URL=http://172.17.0.1:8085
-#   export ANEMOI_LLAMA_SWAP_AUTH_TOKEN=LOCAL
+#   export ANEMOI_LLAMA_SWAP_AUTH_TOKEN='<llama-swap key>'   # from the host secrets file; never commit it
 #   export ANEMOI_CONFIG=/home/alex/anemoi/config/anemoi.prometheus.yaml
 #   export ANEMOI_BIND=0.0.0.0:7070
 #
