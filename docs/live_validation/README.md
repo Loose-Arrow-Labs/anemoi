@@ -12,6 +12,8 @@ of Anemoi against real runtimes.
 | `llama-swap-probe.md` | Read-only HTTP probe procedure for a llama-swap runtime. |
 | `controlled-execution-gate.md` | The `ANEMOI_ENABLE_LIVE_EXECUTE` boundary for non-mock mutation and forwarding. |
 | `residency-truth-contract.md` | Why configured models are not residency evidence. |
+| `distillation-handoff-loss.md` | Procedure for measuring what a delegated executor loses when context is handed off as a written brief instead of carried in full. |
+| `mid-tier-delegation-12b-vs-27b.md` | Procedure for testing whether a 12B with a co-resident delegation tier beats a 27B that exhausts its context window. |
 
 ## Phase Policy
 

@@ -1,0 +1,217 @@
+#!/usr/bin/env bash
+# Point-and-shoot delegated execution: dispatch a task to a local executor model
+# that can farm subtasks to a cheaper co-resident model, then verify the result.
+#
+#   delegate run <task-file> [--repo DIR] [--name NAME]
+#   delegate status [RUN_DIR]
+#   delegate check-pair
+#   delegate models
+#
+# Edit tools/delegate/config.sh to change the model pair. Nothing else needs editing.
+set -uo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=config.sh
+source "$HERE/config.sh"
+EXTENSION="$HERE/../pi-extensions/anemoi-delegate.ts"
+
+die() { echo "error: $*" >&2; exit 1; }
+
+usage() {
+  sed -n '2,10p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  cat <<EOF
+
+Current pair (from config.sh):
+  executor : $EXECUTOR_PROVIDER/$EXECUTOR_MODEL
+  delegate : $DELEGATE_MODEL  via $DELEGATE_BASE_URL
+
+Commands:
+  run <task-file>   Launch a detached run. Prints the run dir and how to watch it.
+  status [RUN_DIR]  Progress by ARTIFACT (files changed, git diff), not by log.
+                    Defaults to the most recent run.
+  check-pair        Verify executor + delegate are actually co-resident.
+  models            List models the backend currently serves.
+EOF
+}
+
+resident() {
+  curl -s -m 20 -H "Authorization: Bearer $DELEGATE_TOKEN" "$LLAMA_SWAP_URL/running" 2>/dev/null \
+    | python -c "import sys,json;d=json.load(sys.stdin);print(' '.join(m.get('model','?') for m in d.get('running',[])))" 2>/dev/null
+}
+
+warm() {
+  local model="$1"
+  curl -s -m 400 -H "Authorization: Bearer $DELEGATE_TOKEN" -H "Content-Type: application/json" \
+    "$DELEGATE_BASE_URL/chat/completions" \
+    -d "{\"model\":\"$model\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply OK\"}],\"max_tokens\":512}" 2>/dev/null \
+    | python -c "import sys,json;d=json.load(sys.stdin);print((d['choices'][0]['message'].get('content') or '').strip()[:20] or 'EMPTY')" 2>/dev/null
+}
+
+cmd_models() {
+  curl -s -m 20 -H "Authorization: Bearer $DELEGATE_TOKEN" "$DELEGATE_BASE_URL/models" \
+    | python -c "import sys,json;[print(m['id']) for m in json.load(sys.stdin).get('data',[])]"
+}
+
+cmd_check_pair() {
+  echo "Checking pair: $EXECUTOR_MODEL + $DELEGATE_MODEL"
+  echo "resident before: $(resident)"
+  echo -n "warming executor... "; warm "$EXECUTOR_MODEL"
+  echo -n "warming delegate... "; warm "$DELEGATE_MODEL"
+  local r; r="$(resident)"
+  echo "resident after : $r"
+  if grep -q "$EXECUTOR_MODEL" <<<"$r" && grep -q "$DELEGATE_MODEL" <<<"$r"; then
+    echo "PASS - both co-resident, delegation will not thrash."
+  else
+    echo "FAIL - they evict each other. Every delegation costs a full reload."
+    echo "Check llama-swap 'matrix.sets.co-located', and GET $LLAMA_SWAP_URL/logs for OOM."
+    return 1
+  fi
+}
+
+cmd_run() {
+  local task="" repo="$PWD" name=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --repo) repo="$2"; shift 2 ;;
+      --name) name="$2"; shift 2 ;;
+      -*) die "unknown flag $1" ;;
+      *) task="$1"; shift ;;
+    esac
+  done
+  [ -n "$task" ] || die "need a task file. usage: delegate run <task-file> [--repo DIR]"
+  [ -f "$task" ] || die "task file not found: $task"
+  [ -d "$repo" ] || die "repo not found: $repo"
+  [ -f "$EXTENSION" ] || die "extension missing: $EXTENSION"
+
+  task="$(cd "$(dirname "$task")" && pwd)/$(basename "$task")"
+  repo="$(cd "$repo" && pwd)"
+  [ -n "$name" ] || name="$(basename "$repo")"
+  local run="$RUNS_ROOT/${name}-$(date +%Y%m%dT%H%M%S)"
+  mkdir -p "$run" || die "cannot create $run"
+
+  cp "$task" "$run/TASK.md"
+  # Baseline the tree so `status` can tell new work from pre-existing changes.
+  git -C "$repo" status --porcelain > "$run/baseline.status" 2>/dev/null
+  git -C "$repo" rev-parse HEAD > "$run/baseline.head" 2>/dev/null
+  printf '%s\n' "$repo" > "$run/repo"
+
+  cat > "$run/run.sh" <<EOF
+#!/usr/bin/env bash
+cd "$repo" || exit 9
+ANEMOI_DELEGATE_MODEL="$DELEGATE_MODEL" \\
+ANEMOI_DELEGATE_BASE_URL="$DELEGATE_BASE_URL" \\
+ANEMOI_DELEGATE_TOKEN="$DELEGATE_TOKEN" \\
+ANEMOI_DELEGATE_MAX_TOKENS="$DELEGATE_MAX_TOKENS" \\
+ANEMOI_DELEGATE_TIMEOUT_MS="$DELEGATE_TIMEOUT_MS" \\
+ANEMOI_DELEGATE_MAX_PROMPT_CHARS="$DELEGATE_MAX_PROMPT_CHARS" \\
+ANEMOI_DELEGATE_LOG="$run/delegations.jsonl" \\
+pi --no-extensions -e "$EXTENSION" \\
+   --provider "$EXECUTOR_PROVIDER" --model "$EXECUTOR_MODEL" \\
+   --session-id "$(basename "$run")" \\
+   -p @"$run/TASK.md" "Follow the instructions in TASK.md. Begin now." \\
+   < /dev/null > "$run/pi.log" 2>&1
+echo "DONE_EXIT_\$?" >> "$run/pi.log"
+EOF
+  chmod +x "$run/run.sh"
+
+  nohup "$run/run.sh" > "$run/wrapper.log" 2>&1 &
+  echo "$!" > "$run/wrapper.pid"
+
+  cat <<EOF
+launched: $(basename "$run")
+  repo     : $repo
+  executor : $EXECUTOR_PROVIDER/$EXECUTOR_MODEL
+  delegate : $DELEGATE_MODEL
+  run dir  : $run
+  wrapper  : pid $(cat "$run/wrapper.pid")
+
+watch it:   $HERE/delegate status
+resume it:  same session id ($(basename "$run")) - relaunch reuses the conversation
+
+Do NOT judge progress by pi.log. Use 'delegate status'.
+EOF
+}
+
+cmd_status() {
+  local run="${1:-}"
+  if [ -z "$run" ]; then
+    run="$(ls -1dt "$RUNS_ROOT"/*/ 2>/dev/null | head -1)"
+    [ -n "$run" ] || die "no runs under $RUNS_ROOT"
+    run="${run%/}"
+  fi
+  [ -d "$run" ] || die "not a run dir: $run"
+  local repo; repo="$(cat "$run/repo" 2>/dev/null)"
+
+  echo "run      : $(basename "$run")"
+  echo "repo     : $repo"
+
+  local wpid alive="no"
+  wpid="$(cat "$run/wrapper.pid" 2>/dev/null)"
+  if [ -n "$wpid" ] && kill -0 "$wpid" 2>/dev/null; then alive="yes"; fi
+  echo "wrapper  : pid ${wpid:-?} alive=$alive"
+
+  local sentinel="no"
+  grep -q "DONE_EXIT" "$run/pi.log" 2>/dev/null && sentinel="$(grep -o 'DONE_EXIT_[0-9]*' "$run/pi.log" | tail -1)"
+  echo "sentinel : $sentinel"
+  echo "pi.log   : $(wc -c < "$run/pi.log" 2>/dev/null || echo 0) bytes (empty is NOT evidence of idleness - output may be unflushed or the redirect broken)"
+
+  # Artifact-based progress. This is the signal that matters: a run whose log is
+  # empty and whose sentinel never lands can still be actively producing work.
+  local recent=""
+  if [ -n "$repo" ] && [ -d "$repo" ]; then
+    # Reference the run's own start, not a rolling window: a freshly created
+    # worktree has checkout-fresh mtimes on every file and would otherwise read
+    # as furious activity.
+    recent="$(find "$repo" -newer "$run/repo" -type f \
+      -not -path '*/.git/*' -not -path '*/node_modules/*' -not -path '*/target/*' \
+      -not -path '*/__pycache__/*' -not -name '*.lock' 2>/dev/null | head -8)"
+    echo "--- files touched since run start ---"
+    [ -n "$recent" ] && printf '%s\n' "$recent" || echo "(none)"
+    echo "--- git status vs run start ---"
+    diff <(cat "$run/baseline.status" 2>/dev/null) <(git -C "$repo" status --porcelain 2>/dev/null) \
+      | grep '^>' | sed 's/^> /  new: /' | head -12
+    [ -z "$(diff <(cat "$run/baseline.status" 2>/dev/null) <(git -C "$repo" status --porcelain 2>/dev/null) | grep '^>')" ] \
+      && echo "  (no new changes yet)"
+  fi
+
+  echo "--- delegations ---"
+  if [ -s "$run/delegations.jsonl" ]; then
+    python - "$run/delegations.jsonl" <<'PY'
+import json,sys
+ok=fail=0; ms=0
+for line in open(sys.argv[1]):
+    try: d=json.loads(line)
+    except Exception: continue
+    if d.get("ok"): ok+=1; ms+=d.get("ms",0)
+    else: fail+=1; print("  FAILED:", d.get("error","?")[:100])
+print(f"  {ok} ok, {fail} failed, {ms}ms total in the cheap tier")
+PY
+  else
+    echo "  none yet - executor has not delegated (run may still be fine, just costlier)"
+  fi
+
+  echo "--- resident ---"
+  echo "  $(resident)"
+
+  echo
+  if [ "$alive" = "no" ] && [ "$sentinel" = "no" ]; then
+    echo "VERDICT: process gone, no sentinel. Check the artifact above before assuming failure -"
+    echo "         a broken redirect looks exactly like this even on a fully successful run."
+  elif [ "$alive" = "yes" ] && [ -z "$recent" ]; then
+    echo "VERDICT: alive, nothing written yet. Normal early on, or while it reads and plans."
+    echo "         Check '$LLAMA_SWAP_URL/logs' before killing anything."
+  elif [ "$alive" = "yes" ]; then
+    echo "VERDICT: working. Files are changing. Leave it alone."
+  else
+    echo "VERDICT: finished ($sentinel). Verify gates yourself before trusting the report."
+  fi
+}
+
+case "${1:-}" in
+  run) shift; cmd_run "$@" ;;
+  status) shift; cmd_status "${1:-}" ;;
+  check-pair) cmd_check_pair ;;
+  models) cmd_models ;;
+  ""|-h|--help|help) usage ;;
+  *) die "unknown command: $1 (try --help)" ;;
+esac
