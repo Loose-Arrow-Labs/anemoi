@@ -1,0 +1,40 @@
+@startuml 11_sequence_staging
+' One pass of run_staging_tick(), fired on a timer by serve().
+skinparam shadowing false
+hide footbox
+
+participant "Staging loop" as Loop
+participant "AppState" as App
+participant "StagingWorker" as Staging
+participant "EscalationContextCache" as Ctx
+participant "RuntimeAdapter" as Runtime
+
+Loop -> App : run_staging_tick()
+activate App
+opt a foreground model is draining
+  App -> Staging : commit_eviction_context(draining, cache)
+  Staging -> Ctx : write(intent_id, payload)
+  Ctx --> Staging : ContextRef
+end
+opt a staged model is already ready
+  App -> Staging : reconcile_ready(ready_models)
+  note right : Pending -> Completed\nwith no runtime call
+end
+App -> Staging : get_pending()
+Staging --> App : pending intents
+loop each pending intent
+  alt live runtime and gate closed
+    App -> Staging : note_tick(id, skip_reason)
+    note right : stays Pending
+  else mock runtime or gate open
+    App -> Staging : note_tick(id, none)
+    App -> Runtime : load_model(background_model)
+    alt load accepted
+      App -> Staging : update_state(id, Completed)
+    else load failed
+      App -> Staging : update_state(id, Failed, error)
+    end
+  end
+end
+deactivate App
+@enduml

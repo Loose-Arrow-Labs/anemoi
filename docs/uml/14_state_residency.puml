@@ -1,0 +1,24 @@
+@startuml 14_state_residency
+' ResidencyState as observed through llama-swap's event stream. Anemoi reports these
+' states; it does not enforce them, and the enum has no transition function.
+skinparam shadowing false
+hide empty description
+
+state "Cold\n(not in residents)" as Cold
+state "Loading" as Loading
+state "HotGpu" as HotGpu
+state "Draining" as Draining
+
+[*] --> Cold
+Cold --> Loading : SSE state = starting
+Loading --> HotGpu : SSE state = ready
+HotGpu --> Draining : SSE state = stopping
+Draining --> Cold : SSE state = stopped\nor shutdown
+
+note right of HotGpu
+  Vocabulary with no llama-swap mapping:
+  WarmCpu, Partial, Serving, Evicting, Failed.
+  They can come from config
+  initial_residents and mock adapters.
+end note
+@enduml

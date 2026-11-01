@@ -1,0 +1,42 @@
+@startuml 04_deployment
+' One daemon process on a single host. Names are generic on purpose.
+skinparam shadowing false
+skinparam nodesep 45
+skinparam ranksep 55
+
+node "Client machine or same host" as ClientNode {
+  artifact "Agent client\n(harness)" as Agent
+  artifact "Browser\n(dashboard)" as Browser
+}
+
+node "Inference host" as Host {
+  node "anemoi-daemon process" as DaemonProc {
+    artifact "HTTP API" as Api
+    artifact "Reconciliation loop" as Reconcile
+    artifact "Staging loop" as StagingLoop
+  }
+  artifact "Policy config\n(YAML)" as Config
+  artifact "Governance overrides\n(optional JSON file)" as Overrides
+  database "Decision log\n(memory, JSONL or SQLite)" as Store
+  node "llama-swap" as Swap {
+    artifact "llama-server\n(model processes)" as Server
+  }
+  node "GPU" as Gpu
+}
+
+Agent --> Api : HTTP
+Browser --> Api : HTTP
+
+DaemonProc ..> Config : reads at start
+DaemonProc ..> Overrides : reads and writes
+DaemonProc --> Store
+Reconcile --> Swap : inspect: /health, /v1/models,\n/metrics, /api/events (SSE)
+Api --> Swap : forwards /v1/chat/completions\n(only with live-execute gate)
+StagingLoop --> Swap : load_model\n(only with live-execute gate)
+Server --> Gpu
+
+note bottom of Swap
+  A client that calls llama-swap directly bypasses
+  Anemoi: none of its governance applies to that traffic.
+end note
+@enduml

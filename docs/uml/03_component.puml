@@ -1,0 +1,49 @@
+@startuml 03_component
+' Component-level design for anemoi-daemon and the APIs it requires.
+' Lollipops are provided APIs; a dashed arrow to a lollipop means the caller requires it.
+skinparam componentStyle uml2
+skinparam shadowing false
+skinparam nodesep 45
+skinparam ranksep 55
+
+interface "OpenAI-compatible API\n/v1/chat/completions, /v1/models" as GatewayAPI
+interface "Operator API\n/status, /decide, /explain/:id,\n/telemetry/*, /staging" as OperatorAPI
+interface "Governance API\n/catalog, /rosters, /domains, /policy" as GovernanceAPI
+
+component "anemoi-daemon" as Daemon {
+  component "Router and Handlers" as Router
+  component "AppState" as App
+  component "Governance" as Gov
+  component "Reconciler" as Rec
+  component "StagingWorker" as Staging
+  component "EscalationContextCache" as Ctx
+
+  Router ..> App : decide(request)
+  Router ..> Gov : apply overrides
+  App ..> Gov : effective()
+  App ..> Rec : get_snapshots()
+  App ..> Staging : queue_intent(...)
+  App ..> Ctx : write / take context
+}
+
+Router -up- GatewayAPI
+Router -up- OperatorAPI
+Router -up- GovernanceAPI
+
+component "anemoi-policy\nScheduler" as Policy
+component "anemoi-runtime\nadapters" as Runtime
+component "anemoi-telemetry\nstores" as Telemetry
+
+interface "decide(request, snapshots)" as DecideAPI
+interface "RuntimeAdapter" as AdapterAPI
+interface "DecisionLog" as LogAPI
+Policy -up- DecideAPI
+Runtime -up- AdapterAPI
+Telemetry -up- LogAPI
+
+Gov ..> DecideAPI : builds effective Scheduler
+App ..> DecideAPI : decide(request, snapshots)
+App ..> AdapterAPI : inspect(), load_model(model)
+Router ..> Runtime : forward_chat_completion(target, body)
+App ..> LogAPI : record_decision(decision)
+@enduml

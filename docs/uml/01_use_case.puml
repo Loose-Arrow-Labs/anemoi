@@ -1,0 +1,52 @@
+@startuml 01_use_case
+' Who uses Anemoi and for what.
+left to right direction
+skinparam actorStyle stick
+skinparam packageStyle rectangle
+skinparam shadowing false
+
+actor "Agent Client\n(pi, OpenCode, Hermes,\nany OpenAI-compatible client)" as Client
+actor "Operator" as Operator
+actor "Runtime\n(llama-swap, Ollama,\nllama.cpp, mock)" as Runtime <<system>>
+
+rectangle "Anemoi" {
+  usecase "Send Chat Completion\nto a Domain" as Chat
+  usecase "Make Scheduling\nDecision" as Decide
+  usecase "Refuse Cold Load\nOver Wait Allowance" as Refuse
+  usecase "Stage Larger Model\nin Background" as Stage
+  usecase "Record Decision\nTelemetry" as Record
+
+  usecase "Inspect Status\nand Residents" as Status
+  usecase "Request a Decision\nWithout Forwarding" as DryRun
+  usecase "Explain a Decision" as Explain
+  usecase "Review Telemetry\non the Dashboard" as Dash
+  usecase "Govern Rosters\nand Model Profiles" as Govern
+  usecase "Check Policy Config" as Check
+
+  usecase "Reconcile Runtime\nState" as Reconcile
+}
+
+Client -- Chat
+Chat ..> Decide : <<include>>
+Refuse ..> Chat : <<extend>>
+Decide ..> Record : <<include>>
+Stage ..> Decide : <<extend>>
+
+Operator -- Status
+Operator -- DryRun
+Operator -- Explain
+Operator -- Dash
+Operator -- Govern
+Operator -- Check
+DryRun ..> Decide : <<include>>
+
+Chat -- Runtime
+Stage -- Runtime
+Reconcile -- Runtime
+
+note as RefuseNote
+  Refuse Cold Load extension point: the decision is
+  ColdLoad and the estimate exceeds the wait allowance
+  (issue #173). The client gets a 503 with Retry-After.
+end note
+@enduml

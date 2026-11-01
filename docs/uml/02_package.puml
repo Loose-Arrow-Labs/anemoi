@@ -1,0 +1,42 @@
+@startuml 02_package
+' Logical view: one package per crate. Arrows are the anemoi-* dependencies
+' declared in each crate's Cargo.toml, pointing from dependent to dependency.
+skinparam packageStyle folder
+skinparam shadowing false
+
+package "anemoi-cli\n(operator commands)" as Cli {
+}
+package "anemoi-mcp\n(MCP tool surface)" as Mcp {
+}
+package "anemoi-daemon\n(HTTP API, gateway, background loops)" as Daemon {
+}
+package "anemoi-policy\n(scheduling, scoring, continuity)" as Policy {
+}
+package "anemoi-runtime\n(runtime adapters)" as RuntimePkg {
+}
+package "anemoi-telemetry\n(decision log, event store)" as Telemetry {
+}
+package "anemoi-core\n(domain types, config)" as Core {
+}
+package "anemoi-guard\n(CI test-quality linter)" as Guard {
+}
+
+Cli ..> Daemon
+Cli ..> Telemetry
+Cli ..> Core
+Mcp ..> Daemon
+Mcp ..> Telemetry
+Mcp ..> Core
+Daemon ..> Policy
+Daemon ..> RuntimePkg
+Daemon ..> Telemetry
+Daemon ..> Core
+Policy ..> Core
+RuntimePkg ..> Core
+Telemetry ..> Core
+
+note right of Guard
+  Depends on no other
+  Anemoi crate.
+end note
+@enduml

@@ -1,0 +1,123 @@
+@startuml 05_class_domain
+' The decision model in anemoi-core: what goes into a decision and what comes out.
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+hide empty members
+hide circle
+
+class InferenceRequest {
+  +id : RequestId
+  +domain : DomainId
+  +prompt_tokens_estimate : Option<u32>
+  +max_output_tokens : Option<u32>
+  +latency_budget_ms : Option<u64>
+}
+class QualityFloor {
+  +minimum_parameter_class : Option<String>
+}
+class EscalationIntent {
+  +task_type : Option<String>
+  +context : Option<String>
+}
+enum ExecutionMode <<enumeration>> {
+  Interactive
+  Batch
+  Background
+}
+
+class Decision {
+  +id : Uuid
+  +request_id : RequestId
+  +selected_model : Option<ModelId>
+  +selected_runtime : Option<RuntimeId>
+  +selected_group : Option<ResidencyGroupId>
+  +background_model : Option<ModelId>
+  +created_at : DateTime<Utc>
+}
+enum DecisionAction <<enumeration>> {
+  ReuseHot
+  PromoteWarm
+  ColdLoad
+  StageBackground
+  Downgrade
+  Defer
+  Deny
+}
+class DecisionScore {
+  +total : i32
+}
+class ScoreContribution {
+  +label : String
+  +value : i32
+}
+class Explanation {
+  +summary : String
+}
+class DecisionReason {
+  +code : String
+  +detail : String
+  +impact : i32
+}
+class RejectedOption {
+  +model_id : Option<ModelId>
+  +runtime_id : Option<RuntimeId>
+  +reason : String
+}
+
+class RuntimeSnapshot {
+  +runtime_id : RuntimeId
+  +available : bool
+  +configured_models : Vec<ModelId>
+}
+class RuntimeMemorySnapshot {
+  +vram_total_mb : Option<u64>
+  +vram_used_mb : Option<u64>
+  +ram_total_mb : Option<u64>
+  +ram_used_mb : Option<u64>
+  +pressure_percent() : Option<u64>
+}
+class ModelResident {
+  +model_id : ModelId
+  +vram_mb : Option<u64>
+  +ram_mb : Option<u64>
+  +kv_cache_mb : Option<u64>
+  +loaded_since : Option<DateTime<Utc>>
+}
+enum ResidencyState <<enumeration>> {
+  Cold
+  Loading
+  WarmCpu
+  Partial
+  HotGpu
+  Serving
+  Draining
+  Evicting
+  Failed
+}
+class ActiveExecution {
+  +request_id : RequestId
+  +model_id : ModelId
+  +started_at : DateTime<Utc>
+}
+class ColocationConstraints {
+  +loadouts : Vec<Vec<ModelId>>
+  +can_colocate(a : ModelId, b : ModelId) : bool
+}
+
+InferenceRequest *-- "1" ExecutionMode : mode
+InferenceRequest *-- "0..1" QualityFloor : quality_floor
+InferenceRequest *-- "0..1" EscalationIntent : escalation_intent
+
+Decision *-- "1" DecisionAction : action
+Decision *-- "1" DecisionScore : score
+Decision *-- "1" Explanation : explanation
+DecisionScore *-- "0..*" ScoreContribution : contributions
+Explanation *-- "0..*" DecisionReason : reasons
+Explanation *-- "0..*" RejectedOption : rejected_options
+
+RuntimeSnapshot *-- "0..*" ModelResident : residents
+RuntimeSnapshot *-- "1" RuntimeMemorySnapshot : memory
+RuntimeSnapshot *-- "0..*" ActiveExecution : active_requests
+RuntimeSnapshot *-- "0..1" ColocationConstraints : colocation
+ModelResident *-- "1" ResidencyState : state
+@enduml

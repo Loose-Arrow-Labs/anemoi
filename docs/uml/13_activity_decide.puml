@@ -1,0 +1,44 @@
+@startuml 13_activity_decide
+' Scheduler::decide in anemoi-policy. Deterministic: same inputs, same result.
+skinparam shadowing false
+
+start
+:Look up domain and its roster in config;
+if (Domain and roster valid?) then (no)
+  :Return PolicyError;
+  stop
+else (yes)
+endif
+:Generate candidates from live or static roster;
+:Score every candidate;
+:Sort by score, highest first (stable sort);
+:Apply quality floor to get eligible candidates;
+if (Any eligible?) then (no)
+  :Build Deny decision with rejected options;
+  stop
+else (yes)
+endif
+:Take best eligible candidate;
+if (Eligible cold model over max_blank_wait_ms\nand a hot or warm fallback exists?) then (yes)
+  if (Background load allowed, degraded preferred,\nand latency budget under load estimate?) then (yes)
+    if (Colocation matrix admits the pair,\nor unknown, or different runtime?) then (yes)
+      :Select fallback with action StageBackground;
+      :Record continuity.stage_background reason;
+      if (Fallback below quality floor?) then (yes)
+        :Record quality_floor.degraded_fallback reason;
+      else (no)
+      endif
+    else (no)
+      :Keep best;
+      :Record continuity.stage_blocked_colocation reason;
+    endif
+  else (no)
+    :Keep best;
+  endif
+else (no)
+  :Keep best;
+endif
+:Combine rejected options;
+:Build Decision with score and explanation;
+stop
+@enduml
