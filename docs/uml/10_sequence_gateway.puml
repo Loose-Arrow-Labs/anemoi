@@ -1,0 +1,53 @@
+@startuml 10_sequence_gateway
+' POST /v1/chat/completions, from chat_completions() in anemoi-daemon.
+skinparam shadowing false
+hide footbox
+
+actor "Agent Client" as Client
+participant "Router\nchat_completions" as Router
+participant "AppState" as App
+participant "Reconciler" as Rec
+participant "Scheduler" as Sched
+participant "StagingWorker" as Staging
+participant "DecisionLog" as Log
+participant "Runtime\n(llama-swap)" as Runtime
+
+Client -> Router : POST /v1/chat/completions\nmodel = domain
+Router -> Router : resolve domain,\nbuild InferenceRequest
+Router -> App : decide(request)
+activate App
+App -> Rec : needs_refresh()
+opt cache empty, stale or errored
+  App -> Runtime : inspect() each runtime
+  Runtime --> App : RuntimeSnapshot
+  App -> Rec : update(runtime_id, snapshot)
+end
+App -> Rec : get_snapshots()
+Rec --> App : snapshots
+App -> Sched : decide(request, snapshots)
+Sched --> App : Decision
+opt action == StageBackground
+  App -> Staging : queue_intent(...)
+  Staging --> App : StagingIntent
+  App -> Log : record_staging_status(...)
+end
+App -> Log : record_decision(decision)
+App --> Router : Decision
+deactivate App
+
+alt no runnable model
+  Router --> Client : 503 with decision id
+else live runtime and gate closed
+  Router --> Client : 403 needs ANEMOI_ENABLE_LIVE_EXECUTE=1
+else ColdLoad estimate over wait allowance
+  Router --> Client : 503 with Retry-After
+else forward
+  Router -> Runtime : forward_chat_completion(target, body)\nmodel = selected model
+  alt forward failed
+    Router --> Client : 502 with decision id
+  else forward succeeded
+    Runtime --> Router : streamed response
+    Router --> Client : stream plus x-anemoi-* headers
+  end
+end
+@enduml

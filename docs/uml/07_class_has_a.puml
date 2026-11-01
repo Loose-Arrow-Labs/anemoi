@@ -1,0 +1,76 @@
+@startuml 07_class_has_a
+' Has-a around AppState. Filled diamond (composition): only this owner holds the part.
+' Open diamond (aggregation): shared through Arc, or passed in by the caller.
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+hide empty members
+hide circle
+
+class AppState {
+  -config : AnemoiConfig
+  -live_execute : Option<bool>
+  +decide(request : InferenceRequest) : Result<Decision>
+  +generate_action_plan(decision : Decision, dry_run : bool) : ActionPlan
+  +plan_evictions(force : bool) : EvictionPlan
+  +run_reconciliation_tick() : void
+  +run_staging_tick() : void
+}
+class Governance {
+  +effective() : EffectiveBundle
+}
+class EffectiveBundle {
+  +config : AnemoiConfig
+}
+class Scheduler {
+  +decide(request : InferenceRequest, snapshots : RuntimeSnapshot[]) : Result<Decision, PolicyError>
+  +generate_candidates(request : InferenceRequest, snapshots : RuntimeSnapshot[]) : Result<CandidateSet, PolicyError>
+}
+class Reconciler {
+  +update(runtime_id : str, snapshot : RuntimeSnapshot) : void
+  +record_error(runtime_id : str, error : String) : void
+  +get_snapshots() : Vec<RuntimeSnapshot>
+  +needs_refresh() : bool
+}
+class ReconciledSnapshot {
+  +snapshot : RuntimeSnapshot
+}
+class StagingWorker {
+  +queue_intent(...) : StagingIntent
+  +get_pending() : Vec<StagingIntent>
+  +update_state(intent_id : Uuid, new_state : StagingState, error : Option<String>) : void
+}
+class StagingIntent {
+  +id : Uuid
+  +decision_id : Uuid
+  +background_model : ModelId
+  +target_runtime : RuntimeId
+  +state : StagingState
+}
+class EscalationContextCache {
+  +write(intent_id : Uuid, payload : String) : ContextRef
+  +take(context_ref : ContextRef) : Option<String>
+}
+class LlamaSwapEventStream
+interface RuntimeAdapter <<interface>>
+interface DecisionLog <<interface>>
+
+AppState o-- "1" Governance : -governance
+AppState o-- "0..*" RuntimeAdapter : -runtimes
+AppState o-- "1" DecisionLog : -decision_log
+AppState *-- "1" Reconciler : -reconciler
+AppState *-- "1" StagingWorker : -staging_worker
+AppState *-- "1" EscalationContextCache : -escalation_context
+AppState o-- "0..*" LlamaSwapEventStream : -event_streams
+
+Governance *-- "1" EffectiveBundle : current
+EffectiveBundle *-- "1" Scheduler : +scheduler
+Reconciler *-- "0..*" ReconciledSnapshot : per runtime
+StagingWorker *-- "0..*" StagingIntent : -queue
+
+note bottom of AppState
+  Cloned into each request handler and background
+  task. Every clone shares the same Reconciler and
+  StagingWorker data, so "only this owner" means
+  the AppState family, not one instance.
+end note
+@enduml

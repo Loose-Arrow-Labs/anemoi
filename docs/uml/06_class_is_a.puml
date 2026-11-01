@@ -1,0 +1,52 @@
+@startuml 06_class_is_a
+' Is-a in Rust: a struct implements a trait. There is no class inheritance, so
+' every arrow here is interface realization. RuntimeAdapter is the Adapter pattern;
+' DecisionLog is Strategy: stores swap behind one contract.
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+hide empty members
+hide circle
+
+interface RuntimeAdapter <<interface>> {
+  +id() : RuntimeId
+  +is_mock() : bool
+  +inspect() : Result<RuntimeSnapshot, RuntimeError>
+  +load_model(model : ModelId) : Result<LoadHandle, RuntimeError>
+  +unload_model(model : ModelId) : Result<(), RuntimeError>
+  +execute(request : ExecutionRequest) : Result<ExecutionHandle, RuntimeError>
+}
+class MockRuntimeAdapter
+class LlamaSwapAdapter
+class OllamaAdapter
+class LlamaCppAdapter
+class HttpInspectAdapter
+
+RuntimeAdapter <|.. MockRuntimeAdapter
+RuntimeAdapter <|.. LlamaSwapAdapter
+RuntimeAdapter <|.. OllamaAdapter
+RuntimeAdapter <|.. LlamaCppAdapter
+RuntimeAdapter <|.. HttpInspectAdapter
+
+interface DecisionLog <<interface>> {
+  +record_decision(decision : Decision) : Result<(), TelemetryError>
+  +get_decision(id : Uuid) : Result<Option<Decision>, TelemetryError>
+  +list_decisions() : Result<Vec<Decision>, TelemetryError>
+  +record_resident_transition(...) : Result<(), TelemetryError>
+  +record_runtime_snapshot_event(...) : Result<(), TelemetryError>
+  +record_staging_status(...) : Result<(), TelemetryError>
+  +record_action_plan(plan : ActionPlan) : Result<(), TelemetryError>
+}
+class InMemoryDecisionLog
+class JsonlDecisionLog
+class SqliteEventStore
+
+DecisionLog <|.. InMemoryDecisionLog
+DecisionLog <|.. JsonlDecisionLog
+DecisionLog <|.. SqliteEventStore
+
+note bottom of MockRuntimeAdapter
+  is_mock() returns true only here. Live adapters
+  keep the default false, which the live-execute
+  gate relies on.
+end note
+@enduml

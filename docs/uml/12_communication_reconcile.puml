@@ -1,0 +1,25 @@
+@startuml 12_communication_reconcile
+' Communication (collaboration) diagram: run_reconciliation_tick() for one runtime
+' whose inspect succeeds. Same content as a sequence diagram, but numbered and compact.
+skinparam shadowing false
+hide circle
+hide empty members
+left to right direction
+
+object "loop : Reconciliation loop" as Loop
+object "state : AppState" as App
+object "adapter : RuntimeAdapter" as Adapter
+object "reconciler : Reconciler" as Rec
+object "log : DecisionLog" as Log
+
+Loop --> App : 1: run_reconciliation_tick()
+App --> Adapter : 2: inspect()
+App --> Rec : 3: get(runtime_id)\n6: update(runtime_id, snapshot)
+App --> Log : 4: record_resident_transition(...)\n5: record_runtime_snapshot_event(...)
+
+note bottom of Rec
+  If inspect() fails, step 2 is followed by
+  record_error(runtime_id, error) instead. The last
+  good snapshot is kept and marked stale.
+end note
+@enduml

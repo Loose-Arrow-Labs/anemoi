@@ -1,0 +1,29 @@
+@startuml 09_pattern_push_cache
+' Looks like Observer, but is not: the stream pushes into a shared cache that has no
+' subscriber list, and AppState still pulls through inspect() on a timer.
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+hide empty members
+hide circle
+
+class "llama-swap /api/events" as Sse <<external>>
+class LlamaSwapEventStream {
+  +cache() : ModelStateCache
+}
+class ModelStateCache <<shared map>> {
+  model id -> LlamaSwapModelState
+}
+class LlamaSwapAdapter {
+  +inspect() : Result<RuntimeSnapshot, RuntimeError>
+}
+class Reconciler
+class AppState {
+  +run_reconciliation_tick() : void
+}
+
+Sse ..> LlamaSwapEventStream : SSE frames (push)
+LlamaSwapEventStream --> "1" ModelStateCache : writes
+LlamaSwapAdapter --> "1" ModelStateCache : reads
+AppState ..> LlamaSwapAdapter : inspect() (pull, on a timer)
+AppState ..> Reconciler : update(runtime_id, snapshot)
+@enduml

@@ -1,0 +1,24 @@
+@startuml 15_state_staging
+' StagingIntent.state in anemoi-daemon. Completed and Failed are terminal.
+skinparam shadowing false
+hide empty description
+
+state "Blocked" as Blocked
+state "Pending" as Pending
+state "Completed" as Completed
+state "Failed" as Failed
+
+[*] --> Blocked : StagingIntent::new
+Blocked --> Pending : queue_intent\n[runnable: mock runtime or gate open]
+Pending --> Completed : load_model accepted\nor model reported ready
+Pending --> Failed : load_model error
+Pending --> Pending : tick skipped\n[live runtime and gate closed] / note_tick
+Completed --> [*]
+Failed --> [*]
+
+note right of Blocked
+  A non-runnable intent stays Blocked with
+  last_error set. Normal flow has no later
+  transition out; a new decision queues a new intent.
+end note
+@enduml

@@ -1,0 +1,44 @@
+@startuml 08_pattern_factory
+' Simple Factory (creational): AppState::new maps each runtime's configured adapter
+' name to a concrete RuntimeAdapter. It is a match in a constructor, not a separate class.
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+hide empty members
+hide circle
+
+class AppState <<Factory>> {
+  +new(config : AnemoiConfig, decision_log : DynDecisionLog) : Result<AppState>
+}
+class RuntimeConfig {
+  +adapter : String
+  +base_url : Option<String>
+  +auth_token : Option<String>
+  +config_path : Option<String>
+}
+interface RuntimeAdapter <<interface>>
+class OllamaAdapter
+class MockRuntimeAdapter
+class LlamaSwapAdapter
+class LlamaCppAdapter
+
+RuntimeAdapter <|.. OllamaAdapter
+RuntimeAdapter <|.. MockRuntimeAdapter
+RuntimeAdapter <|.. LlamaSwapAdapter
+RuntimeAdapter <|.. LlamaCppAdapter
+
+AppState ..> RuntimeConfig : <<use>>
+AppState .up.> OllamaAdapter : <<create>>
+AppState .up.> MockRuntimeAdapter : <<create>>
+AppState .up.> LlamaSwapAdapter : <<create>>
+AppState .up.> LlamaCppAdapter : <<create>>
+
+note bottom of AppState
+  match runtime.adapter {
+    "ollama" -> OllamaAdapter
+    "mock" -> MockRuntimeAdapter
+    "llama_swap" -> LlamaSwapAdapter
+    "llama_cpp" | "llama_server" -> LlamaCppAdapter
+    anything else -> empty MockRuntimeAdapter
+  }
+end note
+@enduml
